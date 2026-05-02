@@ -1,5 +1,7 @@
 // Discord UT Verification Bot — Cloudflare Worker
 
+import * as XLSX from 'xlsx';
+
 const MYUT_API_URL = 'https://api-sia.ut.ac.id/backend-sia/api/graphql';
 const MYUT_URL_PATTERN = /^https:\/\/myut\.ut\.ac\.id\/e\/[a-f0-9]{32}$/;
 const OLD_UT_QR_PATTERN = /^https?:\/\/webservice\.ut\.web\.id\/dp\.php\?id=\d+$/;
@@ -20,14 +22,14 @@ async function verifyDiscordSignature(request, publicKey) {
   const data = encoder.encode(timestamp + body);
 
   const key = await crypto.subtle.importKey(
-    'spki',
+    'raw',
     fromHex(publicKey),
-    { name: 'NODE-ED25519', namedCurve: 'NODE-ED25519' },
+    { name: 'Ed25519', namedCurve: 'Ed25519' },
     true,
     ['verify']
   );
 
-  return crypto.subtle.verify('NODE-ED25519', key, fromHex(signature), data);
+  return crypto.subtle.verify('Ed25519', key, fromHex(signature), data);
 }
 
 function fromHex(hex) {
@@ -91,13 +93,13 @@ async function checkRateLimit(db, discordId) {
 
   if (count === 2) {
     if (now - lastAttempt < RATE_COOLDOWN_3RD) {
-      return { allowed: false, message: 'Please wait 5 minutes before your next verification attempt.' };
+      return { allowed: false, message: 'Silakan tunggu 5 menit sebelum mencoba verifikasi berikutnya.' };
     }
     return { allowed: true };
   }
 
   if (now - lastAttempt < RATE_COOLDOWN_OVER) {
-    return { allowed: false, message: 'Too many attempts. Please wait 1 hour before trying again, or contact an admin for manual approval.' };
+    return { allowed: false, message: 'Terlalu banyak percobaan. Silakan tunggu 1 jam sebelum mencoba lagi, atau hubungi admin untuk persetujuan manual.' };
   }
   return { allowed: true };
 }
@@ -199,7 +201,7 @@ async function handleVerifyCommand(interaction, env, discordId, discordUsername,
     return Response.json({
       type: 4,
       data: {
-        content: `You are already verified! NIM: ${existing.nim}, Nama: ${existing.nama}`,
+        content: `Anda sudah terverifikasi! NIM: ${existing.nim}, Nama: ${existing.nama}`,
         flags: 64,
       },
     });
@@ -227,7 +229,7 @@ async function handleVerifyCommand(interaction, env, discordId, discordUsername,
   return Response.json({
     type: 4,
     data: {
-      content: `Verify your UT student identity by opening this link:\n${verifyUrl}\n\nThis link expires in ${SESSION_EXPIRE_MINUTES} minutes.`,
+      content: `Verifikasi identitas mahasiswa UT Anda dengan membuka tautan ini:\n${verifyUrl}\n\nTautan ini kadaluarsa dalam ${SESSION_EXPIRE_MINUTES} menit.`,
       flags: 64,
     },
   });
@@ -241,14 +243,14 @@ async function handleStatusCommand(interaction, env, discordId) {
   if (!attempt) {
     return Response.json({
       type: 4,
-      data: { content: 'You are not verified yet. Run `/verify` to start.', flags: 64 },
+      data: { content: 'Anda belum terverifikasi. Jalankan `/verify` untuk memulai.', flags: 64 },
     });
   }
 
   return Response.json({
     type: 4,
     data: {
-      content: `**Verified** ✓\nNIM: ${attempt.nim}\nNama: ${attempt.nama}\nStudy Program: ${attempt.study_program}\nUT Region: ${attempt.ut_region}\nClass Of: ${attempt.class_of}\nVerified at: ${attempt.verified_at}`,
+      content: `**Terverifikasi** ✓\nNIM: ${attempt.nim}\nNama: ${attempt.nama}\nProgram Studi: ${attempt.study_program}\nUPBJJ: ${attempt.ut_region}\nMasa Registrasi: ${attempt.class_of}\nDiverifikasi pada: ${attempt.verified_at}`,
       flags: 64,
     },
   });
@@ -261,12 +263,12 @@ async function handleVerificationPage(sessionId, env) {
   ).bind(sessionId).first();
 
   if (!session) {
-    return new Response('Session not found or expired. Please run /verify again.', { status: 404, headers: { 'Content-Type': 'text/plain' } });
+    return new Response('Sesi tidak ditemukan atau kadaluarsa. Silakan jalankan /verify lagi.', { status: 404, headers: { 'Content-Type': 'text/plain' } });
   }
 
   if (new Date(session.expires_at) < new Date()) {
     await env.DB.prepare("UPDATE sessions SET status = 'expired' WHERE id = ?").bind(sessionId).run();
-    return new Response('Session expired. Please run /verify again.', { status: 410, headers: { 'Content-Type': 'text/plain' } });
+    return new Response('Sesi kadaluarsa. Silakan jalankan /verify lagi.', { status: 410, headers: { 'Content-Type': 'text/plain' } });
   }
 
   const html = getVerificationHTML(sessionId);
@@ -280,12 +282,12 @@ async function processVerification(sessionId, request, env, ctx) {
   ).bind(sessionId).first();
 
   if (!session) {
-    return Response.json({ error: 'Session not found or expired. Please run /verify again.' }, { status: 404 });
+    return Response.json({ error: 'Sesi tidak ditemukan atau kadaluarsa. Silakan jalankan /verify lagi.' }, { status: 404 });
   }
 
   if (new Date(session.expires_at) < new Date()) {
     await env.DB.prepare("UPDATE sessions SET status = 'expired' WHERE id = ?").bind(sessionId).run();
-    return Response.json({ error: 'Session expired. Please run /verify again.' }, { status: 410 });
+    return Response.json({ error: 'Sesi kadaluarsa. Silakan jalankan /verify lagi.' }, { status: 410 });
   }
 
   // Parse form data
@@ -294,15 +296,15 @@ async function processVerification(sessionId, request, env, ctx) {
   const imageFile = formData.get('image');
 
   if (!myutUrl || !imageFile) {
-    return Response.json({ error: 'Missing myutUrl or image.' }, { status: 400 });
+    return Response.json({ error: 'myutUrl atau gambar tidak ada.' }, { status: 400 });
   }
 
   // Validate myut URL
   if (!MYUT_URL_PATTERN.test(myutUrl)) {
     if (OLD_UT_QR_PATTERN.test(myutUrl)) {
-      return Response.json({ error: 'That QR code is from a physical student card, which is not supported. Please upload a screenshot of your digital eKTM from myut.ut.ac.id instead.' }, { status: 400 });
+      return Response.json({ error: 'Kode QR tersebut berasal dari kartu mahasiswa fisik, yang tidak didukung. Silakan unggah screenshot eKTM digital dari myut.ut.ac.id sebagai gantinya.' }, { status: 400 });
     }
-    return Response.json({ error: 'Invalid myut URL. The QR code does not contain a valid myut.ut.ac.id link.' }, { status: 400 });
+    return Response.json({ error: 'URL myut tidak valid. Kode QR tidak berisi tautan myut.ut.ac.id yang valid.' }, { status: 400 });
   }
 
   // Check rate limit
@@ -339,7 +341,7 @@ async function processVerification(sessionId, request, env, ctx) {
         "INSERT INTO verify_attempts (id, discord_id, discord_username, status, temp_image_id, nim, nama, study_program, ut_region, class_of, myut_url) VALUES (?, ?, ?, 'failed', ?, ?, ?, ?, ?, ?, ?)"
       ).bind(uuid(), session.discord_id, session.discord_username, tempImageId, studentData.nim, studentData.nama, studentData.studyProgram, studentData.utRegion, studentData.classOf, myutUrl).run();
 
-      return Response.json({ error: 'This NIM is already associated with another verified account.' }, { status: 409 });
+      return Response.json({ error: 'NIM ini sudah terhubung dengan akun terverifikasi lain.' }, { status: 409 });
     }
 
     // Upload to permanent R2
@@ -362,7 +364,18 @@ async function processVerification(sessionId, request, env, ctx) {
     ctx.waitUntil(
       (async () => {
         await assignRole(guildId, session.discord_id, roleId, token);
-        await sendDM(session.discord_id, `Verification successful! ✓\nNIM: ${studentData.nim}\nNama: ${studentData.nama}\nStudy Program: ${studentData.studyProgram}\nUT Region: ${studentData.utRegion}\nClass Of: ${studentData.classOf}`, token);
+        await sendDM(session.discord_id, `✓ Verifikasi Berhasil!
+
+Selamat, ${studentData.nama}!
+
+Anda telah terverifikasi sebagai mahasiswa Universitas Terbuka.
+
+NIM: ${studentData.nim}
+Program Studi: ${studentData.studyProgram}
+UPBJJ: ${studentData.utRegion}
+Masa Registrasi: ${studentData.classOf}
+
+Role "Verified" telah diberikan. Selamat bergabung! 🎉`, token);
       })()
     );
 
@@ -377,14 +390,14 @@ async function processVerification(sessionId, request, env, ctx) {
       "INSERT INTO verify_attempts (id, discord_id, discord_username, status, temp_image_id, myut_url) VALUES (?, ?, ?, 'failed', ?, ?)"
     ).bind(uuid(), session.discord_id, session.discord_username, tempImageId, myutUrl).run();
 
-    return Response.json({ error: `Failed to verify: ${error.message}` }, { status: 500 });
+    return Response.json({ error: `Gagal memverifikasi: ${error.message}` }, { status: 500 });
   }
 }
 
 async function handleRegisterCommands(request, env) {
   const commands = [
-    { name: 'verify', description: 'Verify your UT student identity' },
-    { name: 'status', description: 'Check your verification status' },
+    { name: 'verify', description: 'Verifikasi identitas mahasiswa UT Anda' },
+    { name: 'status', description: 'Cek status verifikasi Anda' },
   ];
 
   const res = await discordAPI(`/applications/${env.DISCORD_APPLICATION_ID}/commands`, 'PUT', env.DISCORD_BOT_TOKEN, commands);
@@ -400,7 +413,7 @@ function getVerificationHTML(sessionId) {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>UT Student Verification</title>
+<title>Verifikasi Mahasiswa UT</title>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #1a1a2e; color: #eee; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
@@ -428,27 +441,29 @@ input[type="file"] { display: none; }
 .loading.show { display: block; }
 .spinner { border: 3px solid #333; border-top: 3px solid #5865F2; border-radius: 50%; width: 32px; height: 32px; animation: spin 1s linear infinite; margin: 0 auto 8px; }
 @keyframes spin { to { transform: rotate(360deg); } }
+.status-success-welcome { margin-bottom: 16px; color: #eee; }
+.status-success-footer { margin-top: 16px; color: #888; font-size: 0.85rem; }
 </style>
 </head>
 <body>
 <div class="container">
-  <h1>UT Student Verification</h1>
-  <p>Upload a screenshot of your digital eKTM from myut.ut.ac.id. The QR code will be read to verify your identity.</p>
+  <h1>Verifikasi Mahasiswa UT</h1>
+  <p>Unggah screenshot eKTM digital Anda dari myut.ut.ac.id. Kode QR akan dibaca untuk memverifikasi identitas Anda.</p>
 
   <div class="upload-area" id="uploadArea">
     <svg viewBox="0 0 24 24"><path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg>
-    <div class="label">Click or drag to upload eKTM image</div>
-    <div class="hint">PNG, JPG, or WebP accepted</div>
+    <div class="label">Klik atau seret untuk mengunggah gambar eKTM</div>
+    <div class="hint">Menerima PNG, JPG, atau WebP</div>
   </div>
   <input type="file" id="fileInput" accept="image/*">
 
   <img class="preview" id="preview" alt="Preview">
 
-  <button class="btn btn-primary" id="verifyBtn" disabled>Verify</button>
+  <button class="btn btn-primary" id="verifyBtn" disabled>Verifikasi</button>
 
   <div class="loading" id="loading">
     <div class="spinner"></div>
-    <div>Processing verification...</div>
+    <div>Memproses verifikasi...</div>
   </div>
 
   <div class="status" id="status"></div>
@@ -499,7 +514,7 @@ async function handleFile(file) {
     const code = jsQR(imageData.data, imageData.width, imageData.height);
 
     if (!code) {
-      showError('Could not read QR code from the image. Please ensure the QR code is clearly visible.');
+      showError('Tidak dapat membaca kode QR dari gambar. Pastikan kode QR terlihat jelas.');
       return;
     }
 
@@ -508,10 +523,10 @@ async function handleFile(file) {
     if (MYUT_PATTERN.test(decoded)) {
       myutUrl = decoded;
     } else if (OLD_PATTERN.test(decoded)) {
-      showError('That QR code is from a physical student card, which is not supported. Please upload a screenshot of your digital eKTM from myut.ut.ac.id instead.');
+      showError('Kode QR tersebut berasal dari kartu mahasiswa fisik, yang tidak didukung. Silakan unggah screenshot eKTM digital dari myut.ut.ac.id sebagai gantinya.');
       return;
     } else {
-      showError('Invalid QR code. The QR code does not contain a valid myut.ut.ac.id link.');
+      showError('Kode QR tidak valid. Kode QR tidak berisi tautan myut.ut.ac.id yang valid.');
       return;
     }
 
@@ -554,28 +569,37 @@ verifyBtn.addEventListener('click', async () => {
 
     if (data.success) {
       status.className = 'status success';
-      status.innerHTML = '<h3>Verification Successful! ✓</h3><p>You have been verified and assigned the Verified role in Discord.</p><div class="student-data">' +
+      status.style.display = 'block';
+      status.innerHTML =
+        '<h3>Verifikasi Berhasil! ✓</h3>' +
+        '<p class="status-success-welcome">Selamat! Anda telah terverifikasi sebagai mahasiswa Universitas Terbuka.</p>' +
+        '<div class="student-data">' +
         '<div><span class="label">NIM</span><span>' + data.data.nim + '</span></div>' +
         '<div><span class="label">Nama</span><span>' + data.data.nama + '</span></div>' +
-        '<div><span class="label">Study Program</span><span>' + data.data.studyProgram + '</span></div>' +
-        '<div><span class="label">UT Region</span><span>' + data.data.utRegion + '</span></div>' +
-        '<div><span class="label">Class Of</span><span>' + data.data.classOf + '</span></div>' +
-        '</div>';
+        '<div><span class="label">Program Studi</span><span>' + data.data.studyProgram + '</span></div>' +
+        '<div><span class="label">UPBJJ</span><span>' + data.data.utRegion + '</span></div>' +
+        '<div><span class="label">Masa Registrasi</span><span>' + data.data.classOf + '</span></div>' +
+        '</div>' +
+        '<p class="status-success-footer">' +
+        'Role "Verified" telah diberikan di Discord. ' +
+        'Anda juga akan menerima DM konfirmasi dari bot. ' +
+        'Selamat bergabung!</p>';
       uploadArea.style.display = 'none';
       preview.style.display = 'none';
       verifyBtn.style.display = 'none';
     } else {
-      showError(data.error || 'Verification failed.');
+      showError(data.error || 'Verifikasi gagal.');
     }
   } catch (e) {
     loading.classList.remove('show');
-    showError('Network error. Please try again.');
+    showError('Terjadi kesalahan jaringan. Silakan coba lagi.');
   }
 });
 
 function showError(msg) {
   status.className = 'status error';
-  status.innerHTML = '<h3>Verification Failed</h3><p>' + msg + '</p>';
+  status.style.display = 'block';
+  status.innerHTML = '<h3>Verifikasi Gagal</h3><p>' + msg + '</p>';
   verifyBtn.disabled = false;
 }
 </script>
@@ -623,19 +647,124 @@ function getAdminToken(request) {
   return null;
 }
 
+// ── Password hashing (PBKDF2) ──
+
+const PBKDF2_ITERATIONS = 100000;
+const PBKDF2_SALT_LEN = 16;
+const PBKDF2_KEY_LEN = 32;
+
+function toBase64(buf) {
+  return btoa(String.fromCharCode(...new Uint8Array(buf)));
+}
+
+function fromBase64(str) {
+  return Uint8Array.from(atob(str), c => c.charCodeAt(0)).buffer;
+}
+
+async function hashPassword(password) {
+  const salt = crypto.getRandomValues(new Uint8Array(PBKDF2_SALT_LEN));
+  const encoder = new TextEncoder();
+  const passwordKey = await crypto.subtle.importKey(
+    'raw', encoder.encode(password),
+    { name: 'PBKDF2' }, false, ['deriveBits']
+  );
+  const hashBuffer = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', salt, iterations: PBKDF2_ITERATIONS, hash: 'SHA-256' },
+    passwordKey, PBKDF2_KEY_LEN * 8
+  );
+  return `pbkdf2:${PBKDF2_ITERATIONS}:${toBase64(salt)}:${toBase64(hashBuffer)}`;
+}
+
+async function verifyPassword(password, storedHash) {
+  if (!storedHash) return false;
+  const parts = storedHash.split(':');
+  if (parts.length !== 4 || parts[0] !== 'pbkdf2') return false;
+  const iterations = parseInt(parts[1]);
+  const salt = fromBase64(parts[2]);
+  const expectedHash = fromBase64(parts[3]);
+  const encoder = new TextEncoder();
+  const passwordKey = await crypto.subtle.importKey(
+    'raw', encoder.encode(password),
+    { name: 'PBKDF2' }, false, ['deriveBits']
+  );
+  const hashBuffer = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', salt, iterations, hash: 'SHA-256' },
+    passwordKey, PBKDF2_KEY_LEN * 8
+  );
+  const a = new Uint8Array(hashBuffer);
+  const b = new Uint8Array(expectedHash);
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
+  return diff === 0;
+}
+
 // ── Admin route handlers ──
 
 async function handleAdminLogin(request, env) {
-  const { email } = await request.json();
-  if (!email) return Response.json({ error: 'Email required' }, { status: 400 });
+  const { email, password } = await request.json();
+  if (!email || !password) return Response.json({ error: 'Email and password required' }, { status: 400 });
 
   const normalized = email.toLowerCase().trim();
-  if (!(await isAdmin(normalized, env.DB))) {
-    return Response.json({ error: 'Not an admin' }, { status: 403 });
+  const admin = await env.DB.prepare(
+    'SELECT password_hash FROM admins WHERE email = ?'
+  ).bind(normalized).first();
+
+  if (!admin) {
+    return Response.json({ error: 'Invalid credentials' }, { status: 403 });
+  }
+
+  if (!admin.password_hash) {
+    return Response.json({ error: 'Password not set for this admin. Contact the administrator.' }, { status: 403 });
+  }
+
+  const valid = await verifyPassword(password, admin.password_hash);
+  if (!valid) {
+    return Response.json({ error: 'Invalid credentials' }, { status: 403 });
   }
 
   const token = await createAdminJWT(normalized, env);
   return Response.json({ token });
+}
+
+async function handleAdminHashPassword(request, env) {
+  const url = new URL(request.url);
+  const password = url.searchParams.get('pwd');
+  if (!password) return Response.json({ error: 'pwd parameter required' }, { status: 400 });
+  const hash = await hashPassword(password);
+  return Response.json({ hash });
+}
+
+async function handleAdminChangePassword(request, env) {
+  const email = await verifyAdminJWT(getAdminToken(request), env);
+  if (!email) return Response.json({ error: 'Unauthorized' }, { status: 401 });
+
+  const { currentPassword, newPassword } = await request.json();
+  if (!currentPassword || !newPassword) {
+    return Response.json({ error: 'currentPassword and newPassword required' }, { status: 400 });
+  }
+
+  if (newPassword.length < 8) {
+    return Response.json({ error: 'New password must be at least 8 characters' }, { status: 400 });
+  }
+
+  const admin = await env.DB.prepare(
+    'SELECT password_hash FROM admins WHERE email = ?'
+  ).bind(email).first();
+
+  if (admin.password_hash) {
+    const valid = await verifyPassword(currentPassword, admin.password_hash);
+    if (!valid) {
+      return Response.json({ error: 'Current password is incorrect' }, { status: 403 });
+    }
+  }
+
+  const newHash = await hashPassword(newPassword);
+  await env.DB.prepare(
+    'UPDATE admins SET password_hash = ? WHERE email = ?'
+  ).bind(newHash, email).run();
+
+  return Response.json({ success: true });
 }
 
 async function handleAdminMe(request, env) {
@@ -703,7 +832,7 @@ async function handleAdminListAttempts(request, env) {
   return Response.json({ attempts: results });
 }
 
-async function handleAdminExportCSV(request, env) {
+async function handleAdminExportExcel(request, env) {
   const email = await verifyAdminJWT(getAdminToken(request), env);
   if (!email) return Response.json({ error: 'Unauthorized' }, { status: 401 });
 
@@ -724,14 +853,18 @@ async function handleAdminExportCSV(request, env) {
   ).all();
 
   const headers = ['Discord ID', 'Discord Username', 'Status', 'NIM', 'Nama', 'Study Program', 'UT Region', 'Class Of', 'MyUT URL', 'Created At', 'Verified At'];
-  const rows = results.map(r => [r.discord_id, r.discord_username, r.status, r.nim, r.nama, r.study_program, r.ut_region, r.class_of, r.myut_url, r.created_at, r.verified_at]);
+  const data = [headers, ...results.map(r => [r.discord_id || '', r.discord_username || '', r.status || '', r.nim || '', r.nama || '', r.study_program || '', r.ut_region || '', r.class_of || '', r.myut_url || '', r.created_at || '', r.verified_at || ''])];
 
-  const csv = [headers.join(','), ...rows.map(r => r.map(v => `"${(v || '').replace(/"/g, '""')}"`).join(','))].join('\n');
+  const wb = XLSX.utils.book_new();
+  const ws = XLSX.utils.aoa_to_sheet(data);
+  XLSX.utils.book_append_sheet(wb, ws, 'Verify Attempts');
 
-  return new Response(csv, {
+  const xlsxBuffer = XLSX.write(wb, { type: 'array', bookType: 'xlsx' });
+
+  return new Response(xlsxBuffer, {
     headers: {
-      'Content-Type': 'text/csv; charset=utf-8',
-      'Content-Disposition': `attachment; filename="verify-export-${filter}.csv"`,
+      'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'Content-Disposition': `attachment; filename="verify-export-${filter}.xlsx"`,
     },
   });
 }
@@ -825,8 +958,9 @@ tr:hover{background:#1a1a2e}
 
 <div class="login" id="loginPage">
   <h2>Admin Login</h2>
-  <p>Enter your admin email to continue</p>
+  <p>Enter your admin credentials</p>
   <input type="email" id="loginEmail" placeholder="admin@example.com">
+  <input type="password" id="loginPassword" placeholder="Password">
   <button onclick="doLogin()">Login</button>
   <div class="error" id="loginError"></div>
 </div>
@@ -842,6 +976,7 @@ tr:hover{background:#1a1a2e}
       <div class="tab active" data-tab="dashboard" onclick="switchTab(this)">Dashboard</div>
       <div class="tab" data-tab="attempts" onclick="switchTab(this)">Verify Attempts</div>
       <div class="tab" data-tab="admins" onclick="switchTab(this)">Admins</div>
+      <div class="tab" data-tab="password" onclick="switchTab(this)">Change Password</div>
     </div>
 
     <div class="panel active" id="panel-dashboard">
@@ -856,7 +991,7 @@ tr:hover{background:#1a1a2e}
           <div class="filter" data-filter="month" onclick="setFilter(this)">Last 30 Days</div>
           <div class="filter" data-filter="year" onclick="setFilter(this)">Last Year</div>
         </div>
-        <button class="export-btn" onclick="exportCSV()">Export CSV</button>
+        <button class="export-btn" data-action="export">Export</button>
       </div>
       <table>
         <thead><tr><th>NIM</th><th>Nama</th><th>Study Program</th><th>UT Region</th><th>Discord</th><th>Status</th><th>Verified At</th><th>eKTM</th></tr></thead>
@@ -870,6 +1005,23 @@ tr:hover{background:#1a1a2e}
         <button onclick="inviteAdmin()">Invite</button>
       </div>
       <div id="adminsList"></div>
+    </div>
+
+    <div class="panel" id="panel-password">
+      <div style="max-width:400px">
+        <p style="color:#888;margin-bottom:16px;font-size:0.9rem">Change your admin account password.</p>
+        <div style="margin-bottom:12px">
+          <input type="password" id="currentPwd" placeholder="Current Password" style="width:100%;padding:12px;border:1px solid #333;border-radius:8px;background:#0f0f1a;color:#eee;font-size:1rem;margin-bottom:12px">
+        </div>
+        <div style="margin-bottom:12px">
+          <input type="password" id="newPwd" placeholder="New Password (min 8 chars)" style="width:100%;padding:12px;border:1px solid #333;border-radius:8px;background:#0f0f1a;color:#eee;font-size:1rem;margin-bottom:12px">
+        </div>
+        <div style="margin-bottom:16px">
+          <input type="password" id="confirmPwd" placeholder="Confirm New Password" style="width:100%;padding:12px;border:1px solid #333;border-radius:8px;background:#0f0f1a;color:#eee;font-size:1rem">
+        </div>
+        <button onclick="changePassword()" class="btn" style="width:100%;padding:12px;background:#5865F2;color:#fff;border:none;border-radius:8px;font-size:1rem;cursor:pointer">Update Password</button>
+        <div id="pwdStatus" style="margin-top:16px;padding:12px;border-radius:8px;display:none"></div>
+      </div>
     </div>
   </div>
 </div>
@@ -885,14 +1037,31 @@ tr:hover{background:#1a1a2e}
 let token = localStorage.getItem('admin_token');
 let currentFilter = 'all';
 
+// Delegated click handlers for dynamic buttons
+document.addEventListener('click', function(e) {
+  const viewBtn = e.target.closest('.view-btn');
+  if (viewBtn && viewBtn.dataset.ektmKey) {
+    viewImage(viewBtn.dataset.ektmKey);
+  }
+  const delBtn = e.target.closest('.del-btn');
+  if (delBtn && delBtn.dataset.email && !delBtn.disabled) {
+    deleteAdmin(delBtn.dataset.email);
+  }
+  const exportBtn = e.target.closest('[data-action="export"]');
+  if (exportBtn) {
+    exportCSV();
+  }
+});
+
 if (token) showApp();
 
 async function doLogin() {
   const email = document.getElementById('loginEmail').value;
+  const password = document.getElementById('loginPassword').value;
   const err = document.getElementById('loginError');
   err.style.display = 'none';
   try {
-    const res = await fetch('/admin/login', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({email}) });
+    const res = await fetch('/admin/login', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({email, password}) });
     const data = await res.json();
     if (data.token) {
       token = data.token;
@@ -966,7 +1135,7 @@ async function loadAttempts() {
       '<td>' + a.discord_username + '</td>' +
       '<td><span class="badge ' + a.status + '">' + a.status + '</span></td>' +
       '<td>' + (a.verified_at || '-') + '</td>' +
-      '<td>' + (a.ektm_image_url ? '<button class="view-btn" onclick="viewImage(\\'' + a.ektm_image_url + '\\')">View</button>' : '-') + '</td>' +
+      '<td>' + (a.ektm_image_url ? '<button class="view-btn" data-ektm-key="' + a.ektm_image_url + '">View</button>' : '-') + '</td>' +
       '</tr>'
     ).join('');
   } catch(e) {}
@@ -982,7 +1151,7 @@ async function loadAdmins() {
       '<div><div class="email">' + a.email + '</div>' +
       (a.invited_by ? '<div class="meta">Invited by ' + a.invited_by + '</div>' : '<div class="meta">Default admin</div>') +
       '</div>' +
-      '<button class="del-btn" onclick="deleteAdmin(\\'' + a.email + '\\', this)"' +
+      '<button class="del-btn" data-email="' + a.email + '"' +
       (a.email === me || a.email === 'krismyid@gmail.com' ? ' disabled' : '') +
       '>Delete</button>' +
       '</div>'
@@ -1001,7 +1170,7 @@ async function inviteAdmin() {
   } catch(e) { alert('Network error'); }
 }
 
-async function deleteAdmin(email, btn) {
+async function deleteAdmin(email) {
   if (!confirm('Remove admin ' + email + '?')) return;
   try {
     const res = await fetch('/admin/delete', { method: 'POST', headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' }, body: JSON.stringify({ deleteEmail: email }) });
@@ -1011,13 +1180,94 @@ async function deleteAdmin(email, btn) {
   } catch(e) { alert('Network error'); }
 }
 
-function viewImage(key) {
-  document.getElementById('modalImage').src = '/admin/image?key=' + encodeURIComponent(key);
-  document.getElementById('imageModal').classList.add('show');
+async function viewImage(key) {
+  try {
+    const res = await fetch('/admin/image?key=' + encodeURIComponent(key), {
+      headers: { 'Authorization': 'Bearer ' + token }
+    });
+    if (!res.ok) throw new Error('Image not found');
+    const blob = await res.blob();
+    document.getElementById('modalImage').src = URL.createObjectURL(blob);
+    document.getElementById('imageModal').classList.add('show');
+  } catch(e) {
+    alert('Failed to load image');
+  }
 }
 
-function exportCSV() {
-  window.open('/admin/export?filter=' + currentFilter, '_blank');
+async function changePassword() {
+  const current = document.getElementById('currentPwd').value;
+  const newPwd = document.getElementById('newPwd').value;
+  const confirm = document.getElementById('confirmPwd').value;
+  const status = document.getElementById('pwdStatus');
+  status.style.display = 'none';
+  if (!current || !newPwd || !confirm) {
+    status.style.display = 'block';
+    status.style.background = '#3a1a1a';
+    status.style.border = '1px solid #5a2d2d';
+    status.textContent = 'Please fill in all fields.';
+    return;
+  }
+  if (newPwd.length < 8) {
+    status.style.display = 'block';
+    status.style.background = '#3a1a1a';
+    status.style.border = '1px solid #5a2d2d';
+    status.textContent = 'New password must be at least 8 characters.';
+    return;
+  }
+  if (newPwd !== confirm) {
+    status.style.display = 'block';
+    status.style.background = '#3a1a1a';
+    status.style.border = '1px solid #5a2d2d';
+    status.textContent = 'New passwords do not match.';
+    return;
+  }
+  try {
+    const res = await fetch('/admin/change-password', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ currentPassword: current, newPassword: newPwd })
+    });
+    const data = await res.json();
+    if (data.success) {
+      document.getElementById('currentPwd').value = '';
+      document.getElementById('newPwd').value = '';
+      document.getElementById('confirmPwd').value = '';
+      status.style.display = 'block';
+      status.style.background = '#1a3a1a';
+      status.style.border = '1px solid #2d5a2d';
+      status.textContent = 'Password updated successfully!';
+    } else {
+      status.style.display = 'block';
+      status.style.background = '#3a1a1a';
+      status.style.border = '1px solid #5a2d2d';
+      status.textContent = data.error || 'Failed to update password.';
+    }
+  } catch(e) {
+    status.style.display = 'block';
+    status.style.background = '#3a1a1a';
+    status.style.border = '1px solid #5a2d2d';
+    status.textContent = 'Network error.';
+  }
+}
+
+async function exportCSV() {
+  try {
+    const res = await fetch('/admin/export?filter=' + currentFilter, {
+      headers: { 'Authorization': 'Bearer ' + token }
+    });
+    if (!res.ok) throw new Error('Export failed');
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'verify-export-' + currentFilter + '.xlsx';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  } catch(e) {
+    alert('Failed to export CSV');
+  }
 }
 </script>
 </body>
@@ -1066,10 +1316,16 @@ export default {
       return handleAdminListAttempts(request, env);
     }
     if (path === '/admin/export' && request.method === 'GET') {
-      return handleAdminExportCSV(request, env);
+      return handleAdminExportExcel(request, env);
     }
     if (path === '/admin/image' && request.method === 'GET') {
       return handleAdminSignedImageUrl(request, env);
+    }
+    if (path === '/admin/hash-password' && request.method === 'GET') {
+      return handleAdminHashPassword(request, env);
+    }
+    if (path === '/admin/change-password' && request.method === 'POST') {
+      return handleAdminChangePassword(request, env);
     }
 
     // Verification page

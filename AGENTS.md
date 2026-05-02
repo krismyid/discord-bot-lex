@@ -2,10 +2,78 @@
 
 ## Project Identity
 
-**Name**: Discord UT Verification Bot
+**Name**: Discord UT Verification Bot (lex-studyhub-verify)
 **Purpose**: Verify UT (Universitas Terbuka) students via myut QR code — runs entirely on Cloudflare's free platform
 **Target**: Universitas Terbuka (UT) student community server
-**Status**: In Development
+**Status**: **Deployed & Working** (2026-05-02)
+
+## Production Deployment (as of 2026-05-02)
+
+**Deployed URL**: `https://lex-studyhub-verify.lexcriminalis.workers.dev`
+**Discord Interactions Endpoint**: `POST /interactions` — verified by Discord ✅
+**Commands Registered**: `/verify`, `/status`
+
+### Cloudflare Bindings (Active)
+| Binding | Resource |
+|---------|----------|
+| D1 Database | `discord-ut-verify` (ID: `eb306616-5e56-4e74-a7b0-49b4df9985ad`) |
+| R2 Temp | `ektm-temp` |
+| R2 Permanent | `ektm-images` |
+
+### Configured Values (Current Test Server)
+- `DISCORD_APPLICATION_ID`: `1500173064959299867`
+- `DISCORD_GUILD_ID`: `864069186367258624`
+- `VERIFIED_ROLE_ID`: `1500174529278771202`
+
+**Secrets set via `wrangler secret put`**:
+- `DISCORD_BOT_TOKEN` ✅
+- `JWT_SECRET` ✅
+
+**Default Admin**: `krismyid@gmail.com` (login at `/admin`)
+
+---
+
+## Recent Changes / Deployment History (2026-05-02)
+
+**IMPORTANT BUG FIX:**
+- **Issue**: Discord Interactions endpoint could not be verified
+- **Root cause**: Signature verification used `'spki'` key format + `'NODE-ED25519'` (Node.js-only)
+- **Fixed**: Changed to `'raw'` key format + `'Ed25519'` standard Web Crypto in `src/worker.js:22-30`
+
+**Worker Renamed**:
+- Old name: `discord-ut-verify` (deleted)
+- New name: `lex-studyhub-verify` (active)
+
+**Infrastructure Created Before This Session**:
+- D1 database `discord-ut-verify`
+- R2 buckets `ektm-temp`, `ektm-images`
+- Tables created + default admin inserted via `schema.sql`
+
+**Password Authentication Added (2026-05-03)**:
+- **Previously**: Admin login was email-only (just checked if email exists in `admins` table)
+- **Now**: PBKDF2 password authentication with SHA-256 (100,000 iterations, 16-byte salt)
+- Database: Added `password_hash TEXT` column to `admins` table
+- Hash format: `pbkdf2:<iterations>:<base64(salt)>:<base64(hash)>`
+- New endpoints:
+  - `GET /admin/hash-password?pwd=xxx` — utility to generate password hash for setup
+  - `POST /admin/change-password` — authenticated endpoint to change password (requires current password)
+- New UI:
+  - Login form now has **Email** + **Password** fields
+  - New "Change Password" tab in admin dashboard
+- **Default admin**: `krismyid@gmail.com` now has password_hash set
+
+**Recent Fixes & Features (2026-05-03)**:
+- **XLSX Export**: Changed from CSV/XML Spreadsheet to real `.xlsx` using `xlsx` npm package (SheetJS)
+- **UI Translation**: All bot responses (`/verify`, `/status`), verification page, error messages → Bahasa Indonesia. Admin dashboard remains English.
+- **Fixed View button**: Admin dashboard eKTM View button was broken (quote escaping + Authorization headers for img tag)
+- **Fixed Export button**: Same Authorization header issue — now fetches with Bearer token, downloads as blob
+- **Fixed success page**: Inline `style.display = 'none'` was overriding CSS class `display: block`
+
+**Auto-Deployment**:
+- To set up: Connect GitHub repo to Cloudflare via Cloudflare Dashboard → Workers & Pages → Create → Application → Connect Git
+- Push to `main` branch → auto-deploys to production
+
+---
 
 ## Core Objectives
 

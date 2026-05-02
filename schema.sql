@@ -39,9 +39,13 @@ CREATE INDEX idx_sessions_discord_id ON sessions(discord_id);
 CREATE TABLE admins (
     id TEXT PRIMARY KEY,
     email TEXT UNIQUE NOT NULL,
+    password_hash TEXT,
     invited_by TEXT,
     created_at TEXT DEFAULT (datetime('now'))
 );
 
 -- Default admin: krismyid@gmail.com
+-- Note: password_hash is NULL initially. Set password after deployment:
+--   1. GET /admin/hash-password?pwd=YourPassword to generate hash
+--   2. UPDATE admins SET password_hash = '<generated_hash>' WHERE email = 'krismyid@gmail.com'
 INSERT INTO admins (id, email) VALUES ('default', 'krismyid@gmail.com');

@@ -1,11 +1,11 @@
-name = "discord-ut-verify"
+name = "lex-studyhub-verify"
 main = "src/worker.js"
 compatibility_date = "2024-12-01"
 
 [[d1_databases]]
 binding = "DB"
 database_name = "discord-ut-verify"
-database_id = ""
+database_id = "eb306616-5e56-4e74-a7b0-49b4df9985ad"
 
 [[r2_buckets]]
 binding = "R2_TEMP"
@@ -16,10 +16,10 @@ binding = "R2_PERM"
 bucket_name = "ektm-images"
 
 [vars]
-DISCORD_PUBLIC_KEY = ""
-DISCORD_APPLICATION_ID = ""
-DISCORD_GUILD_ID = ""
-VERIFIED_ROLE_ID = ""
+DISCORD_PUBLIC_KEY = "54ab0f7205c4b8ac3e807dccdb5891c2d6813ad88d57083ac9da2e4efc166349"
+DISCORD_APPLICATION_ID = "1500173064959299867"
+DISCORD_GUILD_ID = "864069186367258624"
+VERIFIED_ROLE_ID = "1500174529278771202"
 
 # Set secrets via: wrangler secret put <NAME>
 # DISCORD_BOT_TOKEN

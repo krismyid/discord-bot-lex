@@ -21,7 +21,7 @@ A Discord bot that verifies Universitas Terbuka (UT) students via myut QR code. 
 - **Dual R2 Storage**: Temp bucket for every attempt (14-day TTL), permanent bucket for verified eKTMs
 - **NIM Uniqueness**: Same NIM can't verify with a different Discord account
 - **Rate Limiting**: 1st & 2nd attempt instant, 3rd waits 5 min, 4th+ waits 1 hour
-- **Admin Dashboard**: JWT-authenticated web panel — export CSV, view eKTM images, manage admins
+- **Admin Dashboard**: JWT-authenticated web panel with PBKDF2 password login — export XLSX, view eKTM images, manage admins, change password
 - **Zero Cost**: Cloudflare Workers + D1 + R2 free tier
 
 ## Admin Dashboard
@@ -30,12 +30,18 @@ Access via `/admin` — e.g., `https://your-worker.workers.dev/admin`
 
 **Default admin**: `krismyid@gmail.com`
 
+**Authentication**:
+- PBKDF2 with SHA-256 (100,000 iterations, 16-byte salt)
+- Password hash stored in `admins.password_hash` column
+- Format: `pbkdf2:<iterations>:<base64(salt)>:<base64(hash)>`
+
 **Features**:
 - Stats dashboard (total attempts, verified, this month, failed)
 - View all verify attempts with filters (MTD/month/year/all)
-- Export data to CSV (opens in Excel)
+- Export data to **XLSX** (real Excel format via SheetJS)
 - View eKTM images directly from the dashboard
 - Invite/delete admins (protections: can't delete self, can't delete default admin)
+- Change password (with current password verification)
 
 ## Quick Start
 
@@ -68,12 +74,7 @@ Access via `/admin` — e.g., `https://your-worker.workers.dev/admin`
    - Cloudflare Dashboard → R2 → ektm-temp → Settings → Object lifecycle
    - Add rule: Delete objects after 14 days
 
-5. **Run database migration**:
-   ```bash
-   npx wrangler d1 execute discord-ut-verify --file=schema.sql
-   ```
-
-6. **Configure environment**:
+5. **Configure environment**:
    - Edit `wrangler.toml` → fill in `DISCORD_PUBLIC_KEY`, `DISCORD_APPLICATION_ID`, `DISCORD_GUILD_ID`, `VERIFIED_ROLE_ID`
    - Set secrets:
      ```bash
@@ -81,21 +82,34 @@ Access via `/admin` — e.g., `https://your-worker.workers.dev/admin`
      npx wrangler secret put JWT_SECRET   # For admin JWT auth (any long random string)
      ```
 
-7. **Register slash commands** (one-time):
+6. **Run database migration**:
    ```bash
-   npx wrangler dev
-   # In another terminal:
-   curl -X POST http://localhost:8787/register-commands
+   npx wrangler d1 execute discord-ut-verify --file=schema.sql
    ```
 
-8. **Deploy**:
+7. **Deploy**:
    ```bash
    npx wrangler deploy
    ```
 
-9. **Configure Discord Interactions Endpoint**:
-   - Discord Developer Portal → General Information → Interactions Endpoint URL
-   - Set to: `https://your-worker.workers.dev/interactions`
+8. **Register slash commands** (one-time):
+   ```bash
+   curl -X POST https://your-worker.workers.dev/register-commands
+   ```
+
+9. **Set admin password** (required):
+   - Generate a password hash using your deployed worker:
+     ```bash
+     curl "https://your-worker.workers.dev/admin/hash-password?pwd=YourSecurePassword"
+     ```
+   - Update the default admin with the hash:
+     ```bash
+     npx wrangler d1 execute discord-ut-verify --command "UPDATE admins SET password_hash = '<generated_hash>' WHERE email = 'krismyid@gmail.com'"
+     ```
+
+10. **Configure Discord Interactions Endpoint**:
+    - Discord Developer Portal → General Information → Interactions Endpoint URL
+    - Set to: `https://your-worker.workers.dev/interactions`
 
 ### Discord Bot Setup
 
@@ -137,8 +151,8 @@ JWT_SECRET                    # Admin JWT signing key (any long random string)
 ### For Admins
 
 1. Visit `/admin` on your Worker domain
-2. Login with your admin email (default: `krismyid@gmail.com`)
-3. View dashboard, export CSV, view images, manage admins
+2. Login with your admin **email + password** (default: `krismyid@gmail.com`)
+3. View dashboard, export XLSX, view eKTM images, manage admins, change password
 
 ### Discord Commands
 

@@ -1,23 +1,36 @@
 # Project Setup
 
-## Implementation Status
+## Implementation Status (2026-05-02)
 
-### Done
-- `src/worker.js` — Cloudflare Worker with all routes:
-  - Discord Interactions (`/interactions`) — `/verify` and `/status` commands
-  - Verification page (`/v/:sessionId`) — GET + POST processing
-  - Admin dashboard (`/admin/*`) — JWT auth, CSV export, image viewing, admin management
-  - Slash command registration (`/register-commands`)
-- `schema.sql` — D1 schema: `verify_attempts`, `sessions`, `admins` tables
-  - Default admin: `krismyid@gmail.com`
-- `wrangler.toml` — Cloudflare config (D1, R2 bindings, env vars)
-- `package.json` — Dev deps (wrangler CLI only)
-- Documentation (ARCHITECTURE.md, AGENTS.md, README.md, SETUP.md)
+**Status**: Deployed to production, Discord Interactions endpoint verified ✅
 
-### Verified
-- myut GraphQL API: `POST https://api-sia.ut.ac.id/backend-sia/api/graphql` — returns NIM, Nama, Study Program, UT Region, Class Of
-- QR decoding works on digital eKTM screenshots
-- Physical card QR codes are detected and rejected with specific message
+### Done & Deployed
+- `src/worker.js` — All routes working
+  - `/interactions` — Discord signature verification (fixed: `Ed25519/raw` instead of `NODE-ED25519/spki`)
+  - `/v/:sessionId` — Verification page + processing
+  - `/admin/*` — JWT-authenticated dashboard
+- D1 database: `discord-ut-verify` (ID: `eb306616-5e56-4e74-a7b0-49b4df9985ad`)
+- R2 buckets: `ektm-temp`, `ektm-images`
+- Schema migrated: tables created + default admin (`krismyid@gmail.com`)
+- All env vars in `wrangler.toml` configured (current test server values)
+- Secrets set: `DISCORD_BOT_TOKEN`, `JWT_SECRET`
+- Worker deployed: `lex-studyhub-verify` at `https://lex-studyhub-verify.lexcriminalis.workers.dev`
+- Slash commands registered: `/verify`, `/status`
+- Discord Interactions Endpoint URL verified ✅
+
+### Worker Name Note
+- Old name: `discord-ut-verify` (deleted 2026-05-02)
+- New name: `lex-studyhub-verify` (active)
+
+### Critical Bug Fixed (2026-05-02)
+**Problem**: Discord endpoint verification failed.  
+**Cause**: `verifyDiscordSignature()` used:
+- `'spki'` key format (wrong — Discord Public Key is raw 32 bytes)
+- `'NODE-ED25519'` algorithm (Node.js-only, not supported in Cloudflare Workers)
+
+**Fix applied to `src/worker.js:22-30`**:
+- `'raw'` key format
+- `'Ed25519'` standard Web Crypto algorithm
 
 ### Field Naming (Consistent English)
 | Column | API Source | Meaning |
@@ -28,30 +41,27 @@
 | ut_region | namaUpbjj | UT regional center |
 | class_of | masaRegistrasi | Registration period / year |
 
-### To Set Up
-1. Create D1 database: `npx wrangler d1 create discord-ut-verify`
-2. Copy `database_id` into wrangler.toml
-3. Create R2 buckets:
-   ```bash
-   npx wrangler r2 bucket create ektm-temp
-   npx wrangler r2 bucket create ektm-images
-   ```
-4. Set R2 lifecycle rule on `ektm-temp` (14-day auto-delete) in Cloudflare Dashboard
-5. Run migration: `npx wrangler d1 execute discord-ut-verify --file=schema.sql`
-6. Fill in wrangler.toml vars:
-   - `DISCORD_PUBLIC_KEY`
-   - `DISCORD_APPLICATION_ID`
-   - `DISCORD_GUILD_ID`
-   - `VERIFIED_ROLE_ID`
-7. Set secrets:
-   ```bash
-   npx wrangler secret put DISCORD_BOT_TOKEN
-   npx wrangler secret put JWT_SECRET   # any long random string
-   ```
-8. Deploy: `npx wrangler deploy`
-9. Register slash commands: `curl -X POST https://your-worker.workers.dev/register-commands`
-10. Set Interactions Endpoint URL in Discord Developer Portal to:
-    `https://your-worker.workers.dev/interactions`
+### Optional Remaining Setup
+1. **R2 lifecycle rule** for `ektm-temp` (recommended):
+   - Cloudflare Dashboard → R2 → `ektm-temp` → Settings → Object lifecycle
+   - Add rule: Delete objects after 14 days
+
+2. **Discord role hierarchy** (required for role assignment):
+   - Server Settings → Roles
+   - Drag bot's role **above** the "Verified" role
+   - Save
+
+### When Switching to Main Server
+Update in `wrangler.toml`:
+- `DISCORD_GUILD_ID`
+- `VERIFIED_ROLE_ID`
+
+Then re-deploy:
+```bash
+npx wrangler deploy
+```
+
+Slash commands are global to the Discord app, so they work in any server where the bot is invited.
 
 ### To Test Locally
 ```bash

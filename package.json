@@ -25,5 +25,8 @@
   "license": "MIT",
   "devDependencies": {
     "wrangler": "^4.87.0"
+  },
+  "dependencies": {
+    "xlsx": "^0.18.5"
   }
 }

@@ -2,414 +2,187 @@
 
 ## Project Identity
 
-**Name**: Discord University Verification Bot  
-**Purpose**: Verify Discord server members using university Microsoft accounts (@ecampus.ut.ac.id) with manual admin approval  
-**Target**: Universitas Indonesia (UI) college student community server  
-**Status**: In Development  
+**Name**: Discord UT Verification Bot
+**Purpose**: Verify UT (Universitas Terbuka) students via myut QR code — runs entirely on Cloudflare's free platform
+**Target**: Universitas Terbuka (UT) student community server
+**Status**: In Development
 
 ## Core Objectives
 
-1. **User Verification**: Students verify identity using their @ecampus.ut.ac.id Microsoft account via OAuth
-2. **Manual Approval**: Admin reviews and approves/rejects verification requests through web dashboard
-3. **Role Assignment**: Automatically assign "Verified" role in Discord upon admin approval
-4. **Audit Trail**: Track all verification and admin actions for accountability
-5. **Free Hosting**: Deploy using free-tier services (Fly.io + optional Cloudflare)
+1. **User Verification**: Students verify by uploading eKTM screenshot on a web page
+2. **Auto-Approval**: Bot reads QR code, fetches student data from myut API, auto-approves
+3. **Role Assignment**: Assigns "Verified" role via Discord REST API
+4. **Image Storage**: eKTM screenshots in Cloudflare R2 (temp + permanent buckets)
+5. **Admin Dashboard**: JWT-authenticated web panel for admins (CSV export, image viewing, admin management)
+6. **Zero Cost**: Entirely on Cloudflare free tier — Workers, D1, R2
 
-## System Architecture Summary
-
-### Component Overview
-
-```
-Discord Bot (discord.js) ←→ Express Web Server ←→ PostgreSQL Database
-                                    ↑
-                            Microsoft OAuth API
-                                    ↑
-                            Admin Dashboard (HTML/JS)
-```
-
-### Technology Stack
-
-- **Runtime**: Node.js 20 LTS
-- **Discord Library**: discord.js v14+
-- **Web Framework**: Express.js
-- **Database**: PostgreSQL 15
-- **OAuth Provider**: Microsoft Identity Platform (@azure/msal-node)
-- **Authentication**: JWT (jsonwebtoken) + bcrypt
-- **Hosting**: Fly.io (free tier)
-- **CDN**: Cloudflare (optional, for improved performance)
-
-### File Structure
+## System Architecture
 
 ```
-discord-bot/
+Discord (Interactions API) ──POST──> Worker (/interactions)
+                                           │
+                                     /verify → create session in D1
+                                           │
+                                     Reply with verification link
+                                           │
+Student opens link in browser               │
+       │                                    │
+       ▼                                    │
+Worker serves HTML page ←───────────────────┘
+       │
+       ├── Client: jsQR decodes QR from image
+       ├── Client: Canvas converts to WebP
+       └── Client: POSTs {sessionId, myutUrl, webpImage}
+       │
+       ▼
+Worker processes:
+  ├── Validate session (D1)
+  ├── Rate limit check (D1)
+  ├── Call myut GraphQL API → student data
+  ├── Upload WebP to R2 (temp + permanent)
+  ├── Save to D1 (status: approved)
+  ├── Assign role (Discord REST API)
+  └── DM user (Discord REST API)
+
+Admin Dashboard:
+  ├── JWT authentication (HMAC-SHA256 via Web Crypto)
+  ├── View verify attempts + stats
+  ├── Export CSV (MTD/month/year/all)
+  ├── View eKTM images
+  └── Manage admins (invite/delete with protections)
+```
+
+## Technology Stack
+
+| Component | Technology | Why? |
+|---|---|---|
+| Compute | Cloudflare Workers | Free, serverless, always-on |
+| Database | Cloudflare D1 (SQLite) | 5GB free, serverless |
+| Object Storage | Cloudflare R2 | 10GB free, zero egress |
+| QR Reading | jsQR (client-side) | Browser-native, no server processing |
+| Image Conversion | Canvas API (client-side) | Browser-native WebP conversion |
+| Discord API | Interactions API + REST | No WebSocket needed |
+| Admin Auth | JWT (HMAC-SHA256) | No npm packages — Web Crypto only |
+
+## Project Structure
+
+```
+discord-bot-lex/
 ├── src/
-│   ├── bot/              # Discord bot logic
-│   ├── web/              # Express web server
-│   ├── database/         # Database schemas and models
-│   ├── services/         # Business logic (OAuth, email validation)
-│   └── shared/           # Shared utilities (config, logging)
-├── public/               # Static files (admin dashboard UI)
-├── scripts/              # Setup and deployment scripts
-├── .env                  # Environment variables (DO NOT COMMIT)
-├── package.json          # Dependencies
-├── fly.toml              # Fly.io deployment config
-├── ARCHITECTURE.md       # Detailed architecture for humans
-└── AGENTS.md             # This file - AI agent context
+│   └── worker.js         # Cloudflare Worker (all routes + logic)
+├── sample/               # Test eKTM images
+├── schema.sql            # D1 database schema
+├── wrangler.toml         # Cloudflare config (D1, R2 bindings)
+├── package.json          # Dev deps only (wrangler)
+├── ARCHITECTURE.md
+├── AGENTS.md
+├── README.md
+└── SETUP.md
 ```
 
-## Critical Business Logic
+## Verification Flow
 
-### Verification Flow
+1. User runs `/verify` in Discord
+2. Worker creates session UUID in D1, replies with ephemeral link `https://<domain>/v/<sessionId>`
+3. Student opens link in browser
+4. Student uploads eKTM screenshot
+5. **Client-side**: jsQR decodes QR → extracts myut URL. Canvas converts image to WebP.
+6. **Client-side**: POSTs `{sessionId, myutUrl, webpImage}` to Worker
+7. Worker validates session, checks rate limits, calls myut GraphQL API
+8. Worker uploads to R2 (temp + permanent), saves to D1 (approved)
+9. Worker assigns Discord role + sends DM via REST API
 
-1. User runs `/verify` command in Discord
-2. Bot generates unique session token (UUIDv4, expires in 15 minutes)
-3. Bot sends DM with OAuth URL containing session token
-4. User authenticates with Microsoft (must be @ecampus.ut.ac.id)
-5. OAuth callback validates email domain and creates pending verification request
-6. Admin reviews request in dashboard and approves/rejects
-7. Upon approval, bot assigns "Verified" role and sends confirmation DM
+## Anti-Spoofing Layers
 
-### Security Requirements
+1. **Image validation**: Canvas.toBlob() fails on non-images (client-side)
+2. **URL pattern validation**: QR must decode to `https://myut.ut.ac.id/e/<32-char-hex>`
+3. **Physical card detection**: Old `webservice.ut.web.id` QR pattern is rejected with specific message
+4. **Bot fetches data itself**: Student data from myut API, not from QR content
+5. **NIM uniqueness**: Partial unique index in D1 (`WHERE status='approved'`)
+6. **Session binding**: 10-minute expiry, one-time use
 
-**Email Validation**:
-- MUST end with `@ecampus.ut.ac.id` (case-insensitive)
-- NO subdomain spoofing (e.g., reject `@ecampus.ut.ac.id.fake.com`)
-- Validation pattern: `/^[\w\.-]+@ecampus\.ut\.ac\.id$/i`
+## Rate Limiting
 
-**Session Management**:
-- Session tokens: UUIDv4, stored in database
-- Expiry: 15 minutes from creation
-- One-time use: invalidated after successful OAuth callback
-- No client-side storage of sensitive data
+| Attempt | Behavior |
+|---|---|
+| 1st, 2nd | Instant |
+| 3rd | Wait 5 minutes |
+| 4th+ | Wait 1 hour, or contact admin |
 
-**Admin Authentication**:
-- Passwords hashed with bcrypt (cost factor 12)
-- JWT tokens for session (24-hour expiry)
-- HTTPS-only for all admin endpoints
-- Rate limiting: max 10 login attempts per IP per hour
+## Admin Protections
 
-**Rate Limiting**:
-- Max 3 verification attempts per Discord user per hour
-- Max 10 admin login attempts per IP per hour
-- Exponential backoff on repeated failures
+- Admin **cannot delete self**
+- Default admin (`krismyid@gmail.com`) **cannot be deleted**
 
-## Database Schema
+## Database Schema (D1 / SQLite)
 
-### Key Tables
+```sql
+CREATE TABLE verify_attempts (
+    id TEXT PRIMARY KEY,
+    discord_id TEXT NOT NULL,
+    discord_username TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'processing',
+    temp_image_id TEXT,
+    nim TEXT, nama TEXT, study_program TEXT, ut_region TEXT, class_of TEXT, myut_url TEXT,
+    ektm_image_url TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    verified_at TEXT
+);
+CREATE UNIQUE INDEX idx_attempts_nim_approved ON verify_attempts(nim) WHERE status = 'approved';
 
-**users** (verification requests and verified members):
-- `discord_id` (PK): Discord user ID
-- `discord_username`: Discord username for display
-- `email`: University email (@ecampus.ut.ac.id)
-- `full_name`: From Microsoft profile
-- `verification_status`: 'pending' | 'approved' | 'rejected'
-- `session_token`: OAuth session token (nullable)
-- `session_expires_at`: Session expiry timestamp
-- `verified_at`: Approval timestamp
-- `verified_by`: Admin user ID who approved
-- `created_at`: Request creation time
+CREATE TABLE sessions (
+    id TEXT PRIMARY KEY,
+    discord_id TEXT NOT NULL,
+    discord_username TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TEXT DEFAULT (datetime('now')),
+    expires_at TEXT NOT NULL
+);
 
-**admin_users** (admin accounts):
-- `id` (PK): Auto-increment
-- `username`: Unique admin username
-- `password_hash`: Bcrypt hash
-- `discord_id`: Optional Discord ID for admin
-- `created_at`: Account creation time
+CREATE TABLE admins (
+    id TEXT PRIMARY KEY,
+    email TEXT UNIQUE NOT NULL,
+    invited_by TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+INSERT INTO admins (id, email) VALUES ('default', 'krismyid@gmail.com');
+```
 
-**audit_logs** (admin action history):
-- `id` (PK): Auto-increment
-- `admin_id` (FK): Reference to admin_users
-- `action`: Type of action (approve, reject, bulk_approve, etc.)
-- `target_user_id`: Discord ID of affected user
-- `details`: JSON details of the action
-- `timestamp`: Action timestamp
+## Cloudflare R2 Buckets
 
-### Important Constraints
-
-- `users.email` MUST match pattern `%@ecampus.ut.ac.id`
-- `users.verification_status` MUST be one of: pending, approved, rejected
-- `users.session_token` MUST be unique when not null
-- `admin_users.username` MUST be unique
-
-## API Endpoints
-
-### Public Endpoints (no authentication)
-
-- `GET /auth/microsoft?session=<token>` - Redirect to Microsoft OAuth
-- `GET /auth/callback?code=<code>&state=<session>` - OAuth callback handler
-- `GET /verify/success` - Success page after email validation
-- `GET /verify/error?message=<reason>` - Error page
-
-### Admin Endpoints (JWT required)
-
-- `POST /admin/login` - Admin login (returns JWT)
-- `GET /admin/dashboard` - Admin dashboard UI
-- `GET /api/pending` - Get pending verification requests
-- `GET /api/verified` - Get all verified users
-- `POST /api/approve/:userId` - Approve single user
-- `POST /api/approve-all` - Approve all pending users
-- `POST /api/reject/:userId` - Reject user with optional reason
-- `GET /api/audit-logs?limit=50&offset=0` - Get audit history
-- `GET /api/stats` - Get verification statistics
-
-## Discord Bot Commands
-
-### User Commands
-
-- `/verify` - Start verification process (sends DM with OAuth URL)
-- `/status` - Check current verification status
-
-### Admin Commands (require admin role)
-
-- `/list [status]` - List verified members (optionally filter by status)
-- `/unverify <user>` - Remove verification from user
-- `/stats` - Show verification statistics
+| Bucket | Purpose | Key Format | Lifecycle |
+|---|---|---|---|
+| `ektm-temp` | Every verify attempt | `<UUID>.webp` | Auto-delete after 14 days |
+| `ektm-images` | Verified student eKTMs | `ektm/<NIM>.webp` | Permanent |
 
 ## Environment Variables
 
-### Required Variables
+**wrangler.toml vars:**
+- `DISCORD_PUBLIC_KEY` — Discord app public key (for signature verification)
+- `DISCORD_APPLICATION_ID` — Discord app ID
+- `DISCORD_GUILD_ID` — Server ID
+- `VERIFIED_ROLE_ID` — Role to assign
 
-```bash
-# Discord Configuration
-DISCORD_TOKEN=              # Bot token from Discord Developer Portal
-DISCORD_CLIENT_ID=          # Application ID
-DISCORD_GUILD_ID=           # Server ID where bot operates
-VERIFIED_ROLE_ID=           # Role ID to assign verified users
+**Secrets (wrangler secret put):**
+- `DISCORD_BOT_TOKEN` — Bot token
+- `JWT_SECRET` — Admin JWT signing key
 
-# Microsoft OAuth
-MICROSOFT_CLIENT_ID=        # Azure AD application client ID
-MICROSOFT_CLIENT_SECRET=    # Azure AD application secret
-MICROSOFT_TENANT_ID=        # "common" or specific tenant ID
-OAUTH_REDIRECT_URI=         # https://yourdomain.com/auth/callback
+## Key Routes
 
-# Database
-DATABASE_URL=               # PostgreSQL connection string
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/interactions` | Discord Interactions API |
+| GET | `/v/:sessionId` | Serve verification page |
+| POST | `/v/:sessionId` | Process verification |
+| POST | `/register-commands` | Register slash commands |
+| GET | `/admin` | Admin dashboard |
+| POST | `/admin/login` | Admin JWT login |
 
-# Web Server
-PORT=8080                   # Port for Express server
-BASE_URL=                   # https://yourdomain.com
-JWT_SECRET=                 # Random secret for JWT signing
-ADMIN_SESSION_EXPIRE=24h    # JWT expiry time
+## When modifying this project:
 
-# Security
-ALLOWED_EMAIL_DOMAIN=ecampus.ut.ac.id
-SESSION_EXPIRE_MINUTES=15
-MAX_VERIFY_ATTEMPTS=3
-```
-
-## Development Guidelines
-
-### Code Style
-
-- **ES Modules**: Use `import/export` syntax (set `"type": "module"` in package.json)
-- **Async/Await**: Prefer async/await over Promise chains
-- **Error Handling**: Always use try/catch blocks, log errors with context
-- **Logging**: Use structured logging (consider `winston` or `pino`)
-- **Validation**: Validate all user inputs (use `zod` or `joi`)
-
-### Testing Strategy
-
-- **Unit Tests**: Test individual functions (email validation, session management)
-- **Integration Tests**: Test API endpoints and database operations
-- **E2E Tests**: Test full verification flow from Discord command to role assignment
-- **Security Tests**: Test injection attacks, rate limiting, session hijacking
-
-### Common Tasks for AI Agents
-
-#### Adding a New Discord Command
-
-1. Create file in `src/bot/commands/<command-name>.js`
-2. Export object with `data` (SlashCommandBuilder) and `execute(interaction)` function
-3. Register command in `src/bot/index.js`
-4. Add appropriate permission checks if admin-only
-5. Update AGENTS.md with new command documentation
-
-#### Adding a New API Endpoint
-
-1. Create route handler in `src/web/routes/<route-name>.js`
-2. Add middleware for authentication if needed
-3. Implement business logic in `src/web/controllers/<controller-name>.js`
-4. Add database queries in `src/database/models/<model-name>.js`
-5. Update AGENTS.md with endpoint documentation
-6. Add validation for request body/params
-
-#### Database Schema Changes
-
-1. Create migration file in `src/database/migrations/<timestamp>-<description>.sql`
-2. Write both UP and DOWN migration
-3. Test migration on local database
-4. Update model files in `src/database/models/`
-5. Update AGENTS.md database schema section
-6. Run migration on production via deployment script
-
-#### Debugging Common Issues
-
-**Bot not responding to commands**:
-- Check `DISCORD_TOKEN` is valid
-- Verify bot has `applications.commands` scope
-- Ensure commands are registered (run deploy-commands script)
-- Check bot has permission in channel
-
-**OAuth callback failing**:
-- Verify `OAUTH_REDIRECT_URI` matches Azure AD configuration
-- Check `MICROSOFT_CLIENT_ID` and `MICROSOFT_CLIENT_SECRET`
-- Ensure session token hasn't expired
-- Verify HTTPS is enabled (required for OAuth)
-
-**Email validation rejecting valid emails**:
-- Check regex pattern: `/^[\w\.-]+@ecampus\.ut\.ac\.id$/i`
-- Verify no extra whitespace in email
-- Ensure case-insensitive comparison
-
-**Database connection issues**:
-- Verify `DATABASE_URL` format: `postgresql://user:pass@host:port/db`
-- Check Fly.io Postgres is running: `flyctl postgres list`
-- Ensure database migrations have run
-
-## Deployment Process
-
-### Fly.io Deployment
-
-1. **Initial Setup**:
-   ```bash
-   flyctl auth login
-   flyctl launch
-   flyctl postgres create
-   flyctl postgres attach <postgres-app-name>
-   ```
-
-2. **Set Environment Variables**:
-   ```bash
-   flyctl secrets set DISCORD_TOKEN=xxx
-   flyctl secrets set MICROSOFT_CLIENT_ID=xxx
-   flyctl secrets set MICROSOFT_CLIENT_SECRET=xxx
-   flyctl secrets set JWT_SECRET=xxx
-   # ... set all required env vars
-   ```
-
-3. **Deploy**:
-   ```bash
-   flyctl deploy
-   ```
-
-4. **Run Database Migrations**:
-   ```bash
-   flyctl ssh console
-   node scripts/migrate.js
-   ```
-
-5. **Create First Admin**:
-   ```bash
-   node scripts/setup-admin.js
-   ```
-
-### Cloudflare CDN Setup (Optional)
-
-1. Add custom domain in Fly.io dashboard
-2. In Cloudflare DNS, add CNAME record pointing to `<app-name>.fly.dev`
-3. Enable proxy (orange cloud icon)
-4. Configure SSL/TLS to "Full (strict)"
-5. Update `BASE_URL` and `OAUTH_REDIRECT_URI` environment variables
-
-## Security Considerations
-
-### Authentication Flow Security
-
-- Never expose session tokens in URLs (use POST body or secure cookies)
-- Always validate `state` parameter in OAuth callback
-- Implement CSRF protection for admin endpoints
-- Use HTTPS for all endpoints (enforced by Fly.io and Cloudflare)
-
-### Data Privacy
-
-- Store only necessary user data (Discord ID, email, name)
-- Do NOT store Microsoft passwords or tokens
-- Implement data retention policy (delete rejected requests after 30 days)
-- Provide `/delete-my-data` command for GDPR compliance
-
-### Admin Panel Security
-
-- Implement 2FA for admin accounts (future enhancement)
-- Log all admin actions with IP address and timestamp
-- Require admin to re-authenticate for sensitive actions (bulk approve)
-- Use Content Security Policy (CSP) headers
-
-## Known Limitations
-
-1. **Single Server Support**: Bot currently supports one Discord server (configurable via `DISCORD_GUILD_ID`)
-2. **Email Domain**: Only `@ecampus.ut.ac.id` supported (hardcoded, but configurable)
-3. **Manual Approval Required**: No automatic approval (by design for security)
-4. **Session Storage**: Sessions stored in database (consider Redis for better performance at scale)
-5. **No Email Sending**: Bot only sends Discord DMs (no email notifications)
-
-## Future Enhancements
-
-- [ ] Multi-server support (configurable per-guild settings)
-- [ ] Email notifications for verification status
-- [ ] Admin Discord commands (approve via Discord instead of web)
-- [ ] Faculty/department role assignment based on email prefix
-- [ ] Periodic re-verification (e.g., annual check for active students)
-- [ ] Export verified members list (CSV/JSON)
-- [ ] Integrate with university student API for automatic validation
-- [ ] Mobile-friendly admin dashboard
-- [ ] 2FA for admin accounts
-- [ ] Webhook notifications for admins (Discord/Slack)
-
-## AI Agent Instructions
-
-When modifying this project:
-
-1. **Always read ARCHITECTURE.md first** for detailed system design
-2. **Maintain security constraints** - never bypass email validation or authentication
-3. **Follow the established file structure** - don't create random files
-4. **Update documentation** - modify AGENTS.md and ARCHITECTURE.md when adding features
-5. **Test security implications** - consider attack vectors for any changes
-6. **Preserve audit logging** - log all admin actions without exception
-7. **Validate inputs** - never trust user input, always validate
-8. **Handle errors gracefully** - provide user-friendly error messages
-9. **Use environment variables** - never hardcode secrets or configuration
-10. **Write idempotent migrations** - database changes should be reversible
-
-### When asked to add a feature:
-
-1. Determine which layer it belongs to (bot/web/database)
-2. Check if database schema needs changes (create migration first)
-3. Implement business logic in services layer
-4. Add API endpoint or bot command
-5. Update admin dashboard if needed
-6. Add appropriate error handling and validation
-7. Update AGENTS.md and ARCHITECTURE.md
-8. Suggest relevant tests to write
-
-### When debugging:
-
-1. Check environment variables are set correctly
-2. Verify external services (Discord API, Microsoft OAuth) are accessible
-3. Check database connection and schema is up-to-date
-4. Review logs for error stack traces
-5. Test individual components in isolation
-6. Verify permissions (Discord roles, database permissions)
-
-## Contact and Resources
-
-- **Discord Developer Portal**: https://discord.com/developers/applications
-- **Azure AD Portal**: https://portal.azure.com/#blade/Microsoft_AAD_RegisteredApps
-- **Fly.io Dashboard**: https://fly.io/dashboard
-- **Cloudflare Dashboard**: https://dash.cloudflare.com
-- **discord.js Documentation**: https://discord.js.org/docs
-- **Microsoft Graph API**: https://learn.microsoft.com/en-us/graph/overview
-
-## Project Status
-
-**Current Phase**: Architecture and Planning Complete  
-**Next Steps**:
-1. Initialize Node.js project
-2. Set up Discord bot and register commands
-3. Configure Azure AD application for OAuth
-4. Implement database schema
-5. Build verification flow
-6. Create admin dashboard
-7. Deploy to Fly.io
-8. Test end-to-end flow
-
-**Last Updated**: 2026-04-15
+1. Read ARCHITECTURE.md for detailed system design
+2. All server logic is in `src/worker.js` — single file
+3. HTML/CSS/JS for verification page is embedded in `getVerificationHTML()` function
+4. HTML/CSS/JS for admin dashboard is embedded in `getAdminHTML()` function
+5. Test locally with `npx wrangler dev`
+6. Use `wrangler d1 execute discord-ut-verify --local --file=schema.sql` for local DB

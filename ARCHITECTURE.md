@@ -1,464 +1,196 @@
-# Discord University Verification Bot - Architecture
+# Discord UT Verification Bot - Architecture
 
 ## Overview
-A Discord bot for Universitas Indonesia (UI) that verifies members using their @ecampus.ut.ac.id Microsoft accounts with manual admin approval through a web dashboard.
+A Discord bot for Universitas Terbuka (UT) that verifies students via myut QR code. Runs entirely on Cloudflare's free platform — Workers, D1, R2. Zero VPS, zero cost.
 
-## System Architecture
-
-```
-┌────────────────────────────────────────────────────────────────────┐
-│                           USER FLOW                                 │
-└────────────────────────────────────────────────────────────────────┘
-
-Student                     Discord Bot              Web Server           Admin
-   │                            │                         │                │
-   │──/verify─────────────────>│                         │                │
-   │                            │                         │                │
-   │<──DM with OAuth URL────────│                         │                │
-   │                            │                         │                │
-   │────Click URL──────────────────────────────────────>│                │
-   │                            │                         │                │
-   │<──Microsoft Login Page─────────────────────────────│                │
-   │                            │                         │                │
-   │──Login with @ecampus.ut.ac.id──────────────────────>│                │
-   │                            │                         │                │
-   │                            │<──Save to DB────────────│                │
-   │                            │   (status: pending)     │                │
-   │                            │                         │                │
-   │<──"Awaiting approval"──────│                         │                │
-   │                            │                         │                │
-   │                            │                         │<──Login─────────│
-   │                            │                         │                │
-   │                            │                         │──View pending──>│
-   │                            │                         │   requests      │
-   │                            │                         │                │
-   │                            │                         │<──Click Approve─│
-   │                            │<──Update DB─────────────│   (or Approve   │
-   │                            │   (status: approved)    │    All)         │
-   │                            │                         │                │
-   │<──Role assigned + DM───────│                         │                │
-      "You are verified!"        │                         │                │
-```
-
-## Components
-
-### 1. Discord Bot (discord.js)
-**Runtime**: Node.js  
-**Framework**: discord.js v14+  
-**Hosting**: Fly.io (persistent process)
-
-**Responsibilities**:
-- Listen for slash commands
-- Generate OAuth URLs with session tokens
-- Assign "Verified" role upon approval
-- Send DM notifications to users
-- Provide admin commands
-
-**Commands**:
-- `/verify` - Start verification process
-- `/status` - Check verification status
-- `/list` - List all verified members (admin only)
-- `/unverify <user>` - Remove verification (admin only)
-- `/stats` - Show verification statistics (admin only)
-
-### 2. Web Server (Express.js)
-**Runtime**: Node.js  
-**Framework**: Express.js  
-**Hosting**: Same Fly.io instance as Discord bot  
-**Proxy**: Cloudflare CDN (optional but recommended)
-
-**Responsibilities**:
-- Handle Microsoft OAuth callbacks
-- Validate email domain (@ecampus.ut.ac.id)
-- Serve admin dashboard
-- Provide REST API for admin actions
-- Handle admin authentication
-
-**Endpoints**:
-
-**Public Endpoints**:
-- `GET /auth/microsoft` - Redirect to Microsoft OAuth
-- `GET /auth/callback` - Handle OAuth callback
-- `GET /verify/success` - Show success page
-- `GET /verify/error` - Show error page
-
-**Admin Endpoints** (JWT protected):
-- `POST /admin/login` - Admin login
-- `GET /admin/dashboard` - Admin dashboard UI
-- `GET /api/pending` - Get pending verification requests
-- `GET /api/verified` - Get verified users
-- `POST /api/approve/:userId` - Approve single user
-- `POST /api/approve-all` - Approve all pending users
-- `POST /api/reject/:userId` - Reject user
-- `GET /api/audit-logs` - Get admin action history
-
-### 3. Database (PostgreSQL)
-**Hosting**: Fly.io Postgres (free tier)  
-**ORM**: pg (native PostgreSQL driver) or Prisma (optional)
-
-**Schema**:
-
-```sql
--- Users table
-CREATE TABLE users (
-    discord_id VARCHAR(20) PRIMARY KEY,
-    discord_username VARCHAR(255) NOT NULL,
-    email VARCHAR(255) UNIQUE NOT NULL,
-    full_name VARCHAR(255),
-    verification_status VARCHAR(20) DEFAULT 'pending',
-    session_token VARCHAR(255) UNIQUE,
-    session_expires_at TIMESTAMP,
-    verified_at TIMESTAMP,
-    verified_by VARCHAR(20),
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    
-    CONSTRAINT valid_status CHECK (verification_status IN ('pending', 'approved', 'rejected')),
-    CONSTRAINT valid_email CHECK (email LIKE '%@ecampus.ut.ac.id')
-);
-
--- Admin users table
-CREATE TABLE admin_users (
-    id SERIAL PRIMARY KEY,
-    username VARCHAR(100) UNIQUE NOT NULL,
-    password_hash VARCHAR(255) NOT NULL,
-    discord_id VARCHAR(20),
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- Audit logs table
-CREATE TABLE audit_logs (
-    id SERIAL PRIMARY KEY,
-    admin_id INTEGER REFERENCES admin_users(id),
-    action VARCHAR(50) NOT NULL,
-    target_user_id VARCHAR(20),
-    details TEXT,
-    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- Indexes for performance
-CREATE INDEX idx_users_status ON users(verification_status);
-CREATE INDEX idx_users_email ON users(email);
-CREATE INDEX idx_session_token ON users(session_token);
-CREATE INDEX idx_audit_timestamp ON audit_logs(timestamp DESC);
-```
-
-### 4. Admin Dashboard (Static HTML/CSS/JS)
-**Hosting**: Same Fly.io instance (or Cloudflare Pages for better performance)  
-**Framework**: Vanilla JavaScript (no build step needed)
-
-**Features**:
-- Login page with JWT authentication
-- Dashboard showing:
-  - Pending verification count
-  - Total verified users
-  - Recent activity
-- Pending requests table with:
-  - Discord username
-  - Email address
-  - Full name (from Microsoft)
-  - Request timestamp
-  - Individual "Approve" / "Reject" buttons
-- "Approve All" button for bulk approval
-- Verified users list with search/filter
-- Audit log viewer
-- Responsive design (works on mobile)
-
-## Data Flow
-
-### Verification Flow
-
-1. **User initiates verification**:
-   - User runs `/verify` in Discord
-   - Bot generates unique session token (UUID)
-   - Bot stores session in database with 15-minute expiry
-   - Bot sends DM with OAuth URL: `https://yourdomain.com/auth/microsoft?session=<token>`
-
-2. **Microsoft OAuth**:
-   - User clicks URL, redirected to Microsoft login
-   - User logs in with @ecampus.ut.ac.id account
-   - Microsoft redirects back to: `https://yourdomain.com/auth/callback?code=<auth_code>&state=<session_token>`
-
-3. **Callback processing**:
-   - Server validates session token (exists and not expired)
-   - Server exchanges auth code for access token
-   - Server fetches user profile from Microsoft Graph API
-   - Server validates email ends with `@ecampus.ut.ac.id`
-   - Server updates database:
-     ```javascript
-     {
-       email: 'student@ecampus.ut.ac.id',
-       full_name: 'Student Name',
-       verification_status: 'pending'
-     }
-     ```
-   - Server shows success page: "Request submitted, awaiting admin approval"
-   - Bot sends DM to user: "Verification request submitted! An admin will review soon."
-
-4. **Admin approval**:
-   - Admin logs into dashboard
-   - Admin sees pending requests
-   - Admin clicks "Approve" or "Approve All"
-   - Server updates database: `verification_status = 'approved'`, `verified_at = NOW()`
-   - Server logs action in audit_logs
-   - Server notifies Discord bot via internal event
-   - Bot assigns "Verified" role to user
-   - Bot sends DM to user: "You have been verified! Welcome to the server."
-
-### Security Flow
-
-1. **Session Security**:
-   - Session tokens are UUIDv4 (cryptographically random)
-   - Tokens expire after 15 minutes
-   - One-time use only (invalidated after callback)
-   - Stored in database, not client-side
-
-2. **Email Validation**:
-   - Domain validation: MUST end with `@ecampus.ut.ac.id`
-   - No similar domains allowed (e.g., `@ecampus.ut.ac.id.fake.com`)
-   - Email verified by Microsoft OAuth (trusted source)
-
-3. **Admin Authentication**:
-   - Passwords hashed with bcrypt (cost factor 12)
-   - JWT tokens for session management
-   - Tokens expire after 24 hours
-   - HTTPS enforced for all admin endpoints
-
-4. **Rate Limiting**:
-   - Max 3 verification attempts per user per hour
-   - Max 10 login attempts per IP per hour
-   - Exponential backoff on failed attempts
-
-## Deployment Architecture
+## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                     Cloudflare (Optional CDN)                    │
-│  • DDoS Protection                                               │
-│  • SSL/TLS Termination                                           │
-│  • Caching (for static assets)                                   │
-│  • WAF (Web Application Firewall)                                │
-└────────────────────────────┬────────────────────────────────────┘
-                             │
-                             │ HTTPS
-                             ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                         Fly.io App                               │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌────────────────────┐        ┌──────────────────────┐        │
-│  │   Discord Bot      │        │   Express Server     │        │
-│  │                    │◄──────►│                      │        │
-│  │  • WebSocket to    │        │  • OAuth endpoints   │        │
-│  │    Discord Gateway │        │  • Admin API         │        │
-│  │  • Slash commands  │        │  • Static files      │        │
-│  │  • Role assignment │        │                      │        │
-│  └────────────────────┘        └──────────────────────┘        │
-│           │                              │                      │
-│           │                              │                      │
-│           └──────────────┬───────────────┘                      │
-│                          │                                      │
-│                          ▼                                      │
-│              ┌─────────────────────┐                           │
-│              │   PostgreSQL DB     │                           │
-│              │                     │                           │
-│              │  • users            │                           │
-│              │  • admin_users      │                           │
-│              │  • audit_logs       │                           │
-│              └─────────────────────┘                           │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                     CLOUDFLARE PLATFORM                      │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  Discord ──POST──> Worker (/interactions)                    │
+│       │               │                                      │
+│       │               ├── Verify Ed25519 signature           │
+│       │               ├── /verify → create session in D1     │
+│       │               ├── /status → query D1                 │
+│       │               └── Reply with verification link       │
+│       │                                                      │
+│  Student opens link in browser                               │
+│       │                                                      │
+│       ▼                                                      │
+│  Worker serves verification page (HTML/JS)                   │
+│       │                                                      │
+│       ├── Client: jsQR decodes QR code                       │
+│       ├── Client: Canvas converts to WebP                    │
+│       └── Client: POSTs {sessionId, myutUrl, webpImage}      │
+│       │                                                      │
+│       ▼                                                      │
+│  Worker processes verification                               │
+│       │                                                      │
+│       ├── Validate session (D1)                              │
+│       ├── Rate limit check (D1)                              │
+│       ├── Validate myut URL pattern                          │
+│       ├── Call myut GraphQL API → student data               │
+│       ├── Upload WebP to R2 (temp + permanent)               │
+│       ├── Save to D1 (status: approved, verified_at)         │
+│       ├── Discord REST API: assign Verified role             │
+│       └── Discord REST API: DM user confirmation             │
+│                                                              │
+│  Admin opens /admin                                           │
+│       │                                                      │
+│       ├── JWT authentication (HMAC-SHA256 via Web Crypto)    │
+│       ├── View verify attempts + stats                        │
+│       ├── Export CSV (MTD/month/year/all)                     │
+│       ├── View eKTM images from R2 permanent                  │
+│       └── Manage admins (invite/delete)                       │
+│                                                              │
+├─────────────────────────────────────────────────────────────┤
+│  D1 (SQLite)     │  R2 (temp)      │  R2 (permanent)        │
+│  verify_attempts │  <UUID>.webp    │  ektm/<NIM>.webp       │
+│  sessions        │  (14-day TTL)   │  (permanent)           │
+│  admins          │                 │                        │
+└─────────────────────────────────────────────────────────────┘
 
-External Services:
-┌────────────────────────┐
-│   Microsoft Graph API   │  (OAuth provider)
-│   login.microsoftonline │
-│   graph.microsoft.com   │
-└────────────────────────┘
-
-┌────────────────────────┐
-│   Discord API           │  (Bot gateway)
-│   discord.com           │
-└────────────────────────┘
+External:
+  Discord Interactions API (POST inbound)
+  Discord REST API v10 (role assign, DM)
+  myut GraphQL API (api-sia.ut.ac.id)
+  jsQR CDN (client-side QR decoding)
 ```
 
-## Technology Stack
+## Key Design Decisions
 
-| Component | Technology | Why? |
-|-----------|------------|------|
-| Bot Runtime | Node.js 20 LTS | Best discord.js support |
-| Bot Library | discord.js v14 | Most popular, well-documented |
-| Web Server | Express.js | Simple, lightweight |
-| Database | PostgreSQL 15 | Reliable, free on Fly.io |
-| OAuth | @azure/msal-node | Official Microsoft library |
-| Auth | jsonwebtoken + bcrypt | Industry standard |
-| Hosting | Fly.io | Free tier, always-on |
-| CDN | Cloudflare (optional) | Free, fast, secure |
-| Process Manager | PM2 or built-in | Keep bot running |
+### Why no discord.js / WebSocket?
+Cloudflare Workers are request-response (serverless). No persistent WebSocket connection to Discord Gateway. Instead, we use the **Interactions API** — Discord sends POST requests to our Worker endpoint for slash commands.
 
-## Environment Variables
+### Why client-side QR reading + WebP conversion?
+Workers have a 10ms CPU time limit on the free tier. QR decoding and image conversion are CPU-heavy. Moving these to the browser eliminates server-side processing entirely.
 
-Required configuration:
+### Why two R2 buckets?
+- **ektm-temp**: Captures every attempt (success or fail) for auditing. Auto-deleted after 14 days via R2 lifecycle rule.
+- **ektm-images**: Only stores verified student images. Permanent.
 
-```env
-# Discord
-DISCORD_TOKEN=your_bot_token
-DISCORD_CLIENT_ID=your_client_id
-DISCORD_GUILD_ID=your_server_id
-VERIFIED_ROLE_ID=role_id_for_verified_members
+## Worker Routes
 
-# Microsoft OAuth
-MICROSOFT_CLIENT_ID=your_azure_app_client_id
-MICROSOFT_CLIENT_SECRET=your_azure_app_secret
-MICROSOFT_TENANT_ID=common_or_specific_tenant
-OAUTH_REDIRECT_URI=https://yourdomain.com/auth/callback
+| Method | Path | Handler | Purpose |
+|---|---|---|---|
+| POST | `/interactions` | `handleInteraction()` | Discord Interactions API |
+| GET | `/v/:sessionId` | `handleVerificationPage()` | Serve verification HTML |
+| POST | `/v/:sessionId` | `processVerification()` | Process QR + API + save |
+| POST | `/register-commands` | `handleRegisterCommands()` | One-time slash command setup |
+| GET | `/admin` | `getAdminHTML()` | Admin dashboard SPA |
+| POST | `/admin/login` | `handleAdminLogin()` | JWT login |
+| GET | `/admin/me` | `handleAdminMe()` | Get current admin |
+| GET | `/admin/admins` | `handleAdminListAdmins()` | List all admins |
+| POST | `/admin/invite` | `handleAdminInviteAdmin()` | Invite new admin |
+| POST | `/admin/delete` | `handleAdminDeleteAdmin()` | Delete admin (with protections) |
+| GET | `/admin/attempts` | `handleAdminListAttempts()` | List verify attempts |
+| GET | `/admin/export` | `handleAdminExportCSV()` | Export CSV |
+| GET | `/admin/image` | `handleAdminSignedImageUrl()` | Serve eKTM image |
 
-# Database
-DATABASE_URL=postgresql://user:pass@host:5432/dbname
+## Database Schema
 
-# Web Server
-PORT=8080
-BASE_URL=https://yourdomain.com
-JWT_SECRET=random_secret_key_here
-ADMIN_SESSION_EXPIRE=24h
+### verify_attempts
+Every verification attempt — success or failure — is recorded.
 
-# Security
-ALLOWED_EMAIL_DOMAIN=ecampus.ut.ac.id
-SESSION_EXPIRE_MINUTES=15
-MAX_VERIFY_ATTEMPTS=3
+| Column | Type | Purpose |
+|---|---|---|
+| id | TEXT (UUID) | Primary key |
+| discord_id | TEXT | Discord user ID |
+| discord_username | TEXT | Discord username |
+| status | TEXT | `processing`, `approved`, `failed`, `expired` |
+| temp_image_id | TEXT (UUID) | Links to R2 temp bucket file |
+| nim | TEXT | Student NIM (from myut API) |
+| nama | TEXT | Student name |
+| study_program | TEXT | Study program/major |
+| ut_region | TEXT | UT regional center (UPBJJ) |
+| class_of | TEXT | Registration period (e.g. "20231") |
+| myut_url | TEXT | The myut QR URL |
+| ektm_image_url | TEXT | R2 permanent key (ektm/<NIM>.webp) |
+| created_at | TEXT | Attempt timestamp |
+| verified_at | TEXT | Approval timestamp (null if failed) |
+
+Partial unique index: `nim WHERE status='approved'` — same NIM can't be approved twice.
+
+### sessions
+Tracks active verification sessions (10-minute expiry).
+
+| Column | Type | Purpose |
+|---|---|---|
+| id | TEXT (UUID) | Session ID (in verification link) |
+| discord_id | TEXT | Discord user who initiated |
+| discord_username | TEXT | Discord username |
+| status | TEXT | `active`, `used`, `expired` |
+| created_at | TEXT | Creation time |
+| expires_at | TEXT | Expiry time |
+
+### admins
+Admin users for the dashboard. Default admin: `krismyid@gmail.com`.
+
+| Column | Type | Purpose |
+|---|---|---|
+| id | TEXT (UUID) | Primary key |
+| email | TEXT | Admin email (unique) |
+| invited_by | TEXT | Email of admin who invited |
+| created_at | TEXT | Creation time |
+
+Protections:
+- Admin cannot delete self
+- Default admin (`krismyid@gmail.com`) cannot be deleted
+
+## Discord Integration
+
+### Signature Verification
+All requests to `/interactions` are verified via Ed25519 signature using Web Crypto API. This proves requests come from Discord, not a third party.
+
+### Role Assignment
+```
+PUT /guilds/{guild_id}/members/{user_id}/roles/{role_id}
+Authorization: Bot {token}
 ```
 
-## Cloudflare + Fly.io Integration
-
-**Setup**:
-
-1. Deploy app to Fly.io, get URL like: `your-app.fly.dev`
-2. Add custom domain in Fly.io: `bot.yourdomain.com`
-3. In Cloudflare DNS:
-   ```
-   Type: CNAME
-   Name: bot
-   Content: your-app.fly.dev
-   Proxy: ON (orange cloud)
-   ```
-4. Cloudflare automatically provisions SSL certificate
-5. All traffic routes through Cloudflare's CDN
-
-**Benefits**:
-- Free SSL/TLS
-- DDoS protection
-- Faster global access
-- Web Application Firewall (WAF)
-- Analytics and logging
-- Can use Cloudflare Workers for additional logic
-
-**Configuration**:
-```javascript
-// In Express app, trust Cloudflare proxy
-app.set('trust proxy', 1);
-
-// Get real IP from Cloudflare header
-const realIP = req.headers['cf-connecting-ip'] || req.ip;
+### DM User
+```
+POST /users/@me/channels  { recipient_id: userId }  → get DM channel
+POST /channels/{channel_id}/messages  { content: "..." }
 ```
 
-## Scaling Considerations
+Both are fire-and-forget via `ctx.waitUntil()` — they don't block the response.
 
-**Current Architecture** (Free Tier):
-- Supports ~100-500 concurrent users
-- ~1000 verified members
-- ~10 verifications per day
+## Admin Authentication
 
-**If Growth Needed**:
-1. Upgrade Fly.io resources (add RAM/CPU)
-2. Scale PostgreSQL (increase storage)
-3. Add Redis for session caching
-4. Separate bot and web server to different instances
-5. Use Cloudflare Workers for OAuth callbacks (reduce load)
+JWT using HMAC-SHA256 via Web Crypto API. No npm packages needed.
+
+- **Login**: `POST /admin/login` with `{ email }` returns JWT (24-hour expiry)
+- **Subsequent requests**: `Authorization: Bearer <token>` header
+- **Secret**: `JWT_SECRET` set via `wrangler secret put`
+
+## Cloudflare Free Tier Limits
+
+| Service | Limit | Sufficient? |
+|---|---|---|
+| Workers | 100K requests/day, 10ms CPU | Yes — low volume |
+| D1 | 5GB, 5M reads/day, 100K writes/day | Yes |
+| R2 | 10GB, 1M writes/day, 10M reads/day | Yes |
+| Subrequests | 50 per request | Yes — 3-4 per verification |
 
 ## File Structure
 
 ```
-discord-bot/
+discord-bot-lex/
 ├── src/
-│   ├── bot/
-│   │   ├── index.js              # Discord bot entry point
-│   │   ├── commands/
-│   │   │   ├── verify.js         # /verify command
-│   │   │   ├── status.js         # /status command
-│   │   │   ├── list.js           # /list command (admin)
-│   │   │   └── unverify.js       # /unverify command (admin)
-│   │   ├── events/
-│   │   │   ├── ready.js          # Bot ready event
-│   │   │   └── interactionCreate.js
-│   │   └── utils/
-│   │       ├── roleManager.js    # Role assignment logic
-│   │       └── dmHandler.js      # DM sending utilities
-│   │
-│   ├── web/
-│   │   ├── index.js              # Express server entry point
-│   │   ├── routes/
-│   │   │   ├── auth.js           # OAuth routes
-│   │   │   ├── admin.js          # Admin API routes
-│   │   │   └── public.js         # Public routes
-│   │   ├── middleware/
-│   │   │   ├── authMiddleware.js # JWT verification
-│   │   │   └── rateLimiter.js    # Rate limiting
-│   │   └── controllers/
-│   │       ├── oauthController.js
-│   │       └── adminController.js
-│   │
-│   ├── database/
-│   │   ├── index.js              # Database connection
-│   │   ├── schema.sql            # Database schema
-│   │   ├── migrations/           # Database migrations
-│   │   └── models/
-│   │       ├── User.js
-│   │       ├── Admin.js
-│   │       └── AuditLog.js
-│   │
-│   ├── services/
-│   │   ├── microsoftAuth.js      # Microsoft OAuth service
-│   │   ├── emailValidator.js     # Email domain validation
-│   │   └── sessionManager.js     # Session token management
-│   │
-│   └── shared/
-│       ├── config.js             # Configuration loader
-│       ├── logger.js             # Logging utility
-│       └── constants.js          # Shared constants
-│
-├── public/                       # Static files for admin dashboard
-│   ├── index.html                # Login page
-│   ├── dashboard.html            # Admin dashboard
-│   ├── css/
-│   │   └── style.css
-│   └── js/
-│       ├── login.js
-│       └── dashboard.js
-│
-├── scripts/
-│   ├── setup-admin.js            # Create first admin account
-│   ├── deploy.js                 # Deployment helper
-│   └── migrate.js                # Run database migrations
-│
-├── .env.example                  # Environment variables template
-├── .gitignore
-├── package.json
-├── fly.toml                      # Fly.io configuration
-├── ARCHITECTURE.md               # This file
-├── AGENTS.md                     # AI agent documentation
-└── README.md                     # Setup and usage guide
+│   └── worker.js          # All Worker logic (routes, Discord API, myut API, R2, D1)
+├── sample/                # Test eKTM images
+│   ├── ektm1.png          # Digital eKTM screenshot (PNG)
+│   ├── ektm2.jpg          # Digital eKTM screenshot (JPG)
+│   └── ektm3.jpg          # Physical card photo (rejected by QR pattern)
+├── schema.sql             # D1 schema (verify_attempts + sessions + admins)
+├── wrangler.toml          # Cloudflare bindings + env vars
+├── package.json           # Dev deps only (wrangler)
+├── ARCHITECTURE.md        # This file
+├── AGENTS.md              # AI agent context
+├── README.md              # Setup guide
+└── SETUP.md               # Implementation status
 ```
-
-## Next Steps
-
-1. Set up Discord bot application in Discord Developer Portal
-2. Set up Azure AD application for Microsoft OAuth
-3. Initialize Node.js project and install dependencies
-4. Create database schema
-5. Implement bot commands
-6. Implement web server and OAuth flow
-7. Build admin dashboard
-8. Deploy to Fly.io
-9. (Optional) Configure Cloudflare CDN
-10. Create first admin account
-11. Test verification flow end-to-end

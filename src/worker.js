@@ -1,0 +1,1088 @@
+// Discord UT Verification Bot — Cloudflare Worker
+
+const MYUT_API_URL = 'https://api-sia.ut.ac.id/backend-sia/api/graphql';
+const MYUT_URL_PATTERN = /^https:\/\/myut\.ut\.ac\.id\/e\/[a-f0-9]{32}$/;
+const OLD_UT_QR_PATTERN = /^https?:\/\/webservice\.ut\.web\.id\/dp\.php\?id=\d+$/;
+const SESSION_EXPIRE_MINUTES = 10;
+const RATE_COOLDOWN_3RD = 5 * 60 * 1000; // 5 min
+const RATE_COOLDOWN_OVER = 60 * 60 * 1000; // 1 hour
+
+// ── Discord signature verification ──
+
+async function verifyDiscordSignature(request, publicKey) {
+  const signature = request.headers.get('X-Signature-Ed25519');
+  const timestamp = request.headers.get('X-Signature-Timestamp');
+  const body = await request.clone().text();
+
+  if (!signature || !timestamp) return false;
+
+  const encoder = new TextEncoder();
+  const data = encoder.encode(timestamp + body);
+
+  const key = await crypto.subtle.importKey(
+    'spki',
+    fromHex(publicKey),
+    { name: 'NODE-ED25519', namedCurve: 'NODE-ED25519' },
+    true,
+    ['verify']
+  );
+
+  return crypto.subtle.verify('NODE-ED25519', key, fromHex(signature), data);
+}
+
+function fromHex(hex) {
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < hex.length; i += 2) {
+    bytes[i / 2] = parseInt(hex.substr(i, 2), 16);
+  }
+  return bytes.buffer;
+}
+
+// ── Discord REST API helpers ──
+
+function discordAPI(path, method, token, body) {
+  const opts = {
+    method,
+    headers: { 'Authorization': `Bot ${token}`, 'Content-Type': 'application/json' },
+  };
+  if (body) opts.body = JSON.stringify(body);
+  return fetch(`https://discord.com/api/v10${path}`, opts);
+}
+
+async function assignRole(guildId, userId, roleId, token) {
+  const res = await discordAPI(`/guilds/${guildId}/members/${userId}/roles/${roleId}`, 'PUT', token);
+  return res.ok;
+}
+
+async function sendDM(userId, content, token) {
+  const channelRes = await discordAPI('/users/@me/channels', 'POST', token, { recipient_id: userId });
+  if (!channelRes.ok) return false;
+  const channel = await channelRes.json();
+  const msgRes = await discordAPI(`/channels/${channel.id}/messages`, 'POST', token, { content });
+  return msgRes.ok;
+}
+
+async function sendFollowup(token, appId, content, ephemeral = true) {
+  return fetch(`https://discord.com/api/v10/webhooks/${appId}/${token}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ content, flags: ephemeral ? 64 : 0 }),
+  });
+}
+
+// ── UUID generation ──
+
+function uuid() {
+  return crypto.randomUUID();
+}
+
+// ── Rate limiting ──
+
+async function checkRateLimit(db, discordId) {
+  const { results } = await db.prepare(
+    "SELECT created_at FROM verify_attempts WHERE discord_id = ? AND created_at > datetime('now', '-1 hour') ORDER BY created_at DESC"
+  ).bind(discordId).all();
+
+  const count = results.length;
+  if (count < 2) return { allowed: true };
+
+  const lastAttempt = new Date(results[0].created_at).getTime();
+  const now = Date.now();
+
+  if (count === 2) {
+    if (now - lastAttempt < RATE_COOLDOWN_3RD) {
+      return { allowed: false, message: 'Please wait 5 minutes before your next verification attempt.' };
+    }
+    return { allowed: true };
+  }
+
+  if (now - lastAttempt < RATE_COOLDOWN_OVER) {
+    return { allowed: false, message: 'Too many attempts. Please wait 1 hour before trying again, or contact an admin for manual approval.' };
+  }
+  return { allowed: true };
+}
+
+// ── Myut API ──
+
+async function fetchStudentData(myutUrl) {
+  const match = myutUrl.match(/\/e\/([a-f0-9]{32})$/);
+  if (!match) throw new Error('Invalid myut URL format');
+
+  const query = `query getEktmPublic($idEktm: String!) {
+    getEktmPublic(idEktm: $idEktm) {
+      nim
+      namaMahasiswa
+      namaProgramStudi
+      namaUpbjj
+      masaRegistrasi
+    }
+  }`;
+
+  const res = await fetch(MYUT_API_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Origin': 'https://myut.ut.ac.id',
+      'Referer': 'https://myut.ut.ac.id/',
+    },
+    body: JSON.stringify({ query, variables: { idEktm: match[1] } }),
+  });
+
+  if (!res.ok) throw new Error(`myut API returned ${res.status}`);
+
+  const json = await res.json();
+  if (!json.data?.getEktmPublic) throw new Error('No student data returned from myut API');
+
+  const d = json.data.getEktmPublic;
+  return {
+    nim: d.nim,
+    nama: d.namaMahasiswa,
+    studyProgram: d.namaProgramStudi,
+    utRegion: d.namaUpbjj,
+    classOf: d.masaRegistrasi,
+  };
+}
+
+// ── R2 uploads ──
+
+async function uploadToTemp(r2Temp, webpBuffer, id) {
+  const key = `${id}.webp`;
+  await r2Temp.put(key, webpBuffer, { httpMetadata: { contentType: 'image/webp' } });
+  return key;
+}
+
+async function uploadToPerm(r2Perm, webpBuffer, nim) {
+  const key = `ektm/${nim}.webp`;
+  await r2Perm.put(key, webpBuffer, { httpMetadata: { contentType: 'image/webp' } });
+  return key;
+}
+
+// ── Route handlers ──
+
+async function handleInteraction(request, env) {
+  const isValid = await verifyDiscordSignature(request, env.DISCORD_PUBLIC_KEY);
+  if (!isValid) return new Response('Invalid signature', { status: 401 });
+
+  const interaction = await request.json();
+
+  // PING
+  if (interaction.type === 1) {
+    return Response.json({ type: 1 });
+  }
+
+  // Slash command
+  if (interaction.type === 2) {
+    const { name } = interaction.data;
+    const discordId = interaction.member?.user?.id;
+    const discordUsername = interaction.member?.user?.username;
+    const hostname = new URL(request.url).hostname;
+
+    if (name === 'verify') {
+      return handleVerifyCommand(interaction, env, discordId, discordUsername, hostname);
+    }
+
+    if (name === 'status') {
+      return handleStatusCommand(interaction, env, discordId);
+    }
+  }
+
+  return Response.json({ type: 4, data: { content: 'Unknown command.', flags: 64 } });
+}
+
+async function handleVerifyCommand(interaction, env, discordId, discordUsername, hostname) {
+  // Check if already verified
+  const existing = await env.DB.prepare(
+    "SELECT nim, nama FROM verify_attempts WHERE discord_id = ? AND status = 'approved' LIMIT 1"
+  ).bind(discordId).first();
+
+  if (existing) {
+    return Response.json({
+      type: 4,
+      data: {
+        content: `You are already verified! NIM: ${existing.nim}, Nama: ${existing.nama}`,
+        flags: 64,
+      },
+    });
+  }
+
+  // Check rate limit
+  const rateLimit = await checkRateLimit(env.DB, discordId);
+  if (!rateLimit.allowed) {
+    return Response.json({
+      type: 4,
+      data: { content: rateLimit.message, flags: 64 },
+    });
+  }
+
+  // Create session
+  const sessionId = uuid();
+  const expiresAt = new Date(Date.now() + SESSION_EXPIRE_MINUTES * 60 * 1000).toISOString();
+
+  await env.DB.prepare(
+    'INSERT INTO sessions (id, discord_id, discord_username, status, expires_at) VALUES (?, ?, ?, ?, ?)'
+  ).bind(sessionId, discordId, discordUsername, 'active', expiresAt).run();
+
+  const verifyUrl = `https://${hostname}/v/${sessionId}`;
+
+  return Response.json({
+    type: 4,
+    data: {
+      content: `Verify your UT student identity by opening this link:\n${verifyUrl}\n\nThis link expires in ${SESSION_EXPIRE_MINUTES} minutes.`,
+      flags: 64,
+    },
+  });
+}
+
+async function handleStatusCommand(interaction, env, discordId) {
+  const attempt = await env.DB.prepare(
+    "SELECT nim, nama, study_program, ut_region, class_of, status, verified_at FROM verify_attempts WHERE discord_id = ? AND status = 'approved' ORDER BY verified_at DESC LIMIT 1"
+  ).bind(discordId).first();
+
+  if (!attempt) {
+    return Response.json({
+      type: 4,
+      data: { content: 'You are not verified yet. Run `/verify` to start.', flags: 64 },
+    });
+  }
+
+  return Response.json({
+    type: 4,
+    data: {
+      content: `**Verified** ✓\nNIM: ${attempt.nim}\nNama: ${attempt.nama}\nStudy Program: ${attempt.study_program}\nUT Region: ${attempt.ut_region}\nClass Of: ${attempt.class_of}\nVerified at: ${attempt.verified_at}`,
+      flags: 64,
+    },
+  });
+}
+
+async function handleVerificationPage(sessionId, env) {
+  // Validate session
+  const session = await env.DB.prepare(
+    "SELECT * FROM sessions WHERE id = ? AND status = 'active'"
+  ).bind(sessionId).first();
+
+  if (!session) {
+    return new Response('Session not found or expired. Please run /verify again.', { status: 404, headers: { 'Content-Type': 'text/plain' } });
+  }
+
+  if (new Date(session.expires_at) < new Date()) {
+    await env.DB.prepare("UPDATE sessions SET status = 'expired' WHERE id = ?").bind(sessionId).run();
+    return new Response('Session expired. Please run /verify again.', { status: 410, headers: { 'Content-Type': 'text/plain' } });
+  }
+
+  const html = getVerificationHTML(sessionId);
+  return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+}
+
+async function processVerification(sessionId, request, env, ctx) {
+  // Validate session
+  const session = await env.DB.prepare(
+    "SELECT * FROM sessions WHERE id = ? AND status = 'active'"
+  ).bind(sessionId).first();
+
+  if (!session) {
+    return Response.json({ error: 'Session not found or expired. Please run /verify again.' }, { status: 404 });
+  }
+
+  if (new Date(session.expires_at) < new Date()) {
+    await env.DB.prepare("UPDATE sessions SET status = 'expired' WHERE id = ?").bind(sessionId).run();
+    return Response.json({ error: 'Session expired. Please run /verify again.' }, { status: 410 });
+  }
+
+  // Parse form data
+  const formData = await request.formData();
+  const myutUrl = formData.get('myutUrl');
+  const imageFile = formData.get('image');
+
+  if (!myutUrl || !imageFile) {
+    return Response.json({ error: 'Missing myutUrl or image.' }, { status: 400 });
+  }
+
+  // Validate myut URL
+  if (!MYUT_URL_PATTERN.test(myutUrl)) {
+    if (OLD_UT_QR_PATTERN.test(myutUrl)) {
+      return Response.json({ error: 'That QR code is from a physical student card, which is not supported. Please upload a screenshot of your digital eKTM from myut.ut.ac.id instead.' }, { status: 400 });
+    }
+    return Response.json({ error: 'Invalid myut URL. The QR code does not contain a valid myut.ut.ac.id link.' }, { status: 400 });
+  }
+
+  // Check rate limit
+  const rateLimit = await checkRateLimit(env.DB, session.discord_id);
+  if (!rateLimit.allowed) {
+    return Response.json({ error: rateLimit.message }, { status: 429 });
+  }
+
+  // Check if NIM already verified by different discord account
+  const nimCheck = await env.DB.prepare(
+    "SELECT discord_id FROM verify_attempts WHERE nim = (SELECT nim FROM verify_attempts WHERE myut_url = ? LIMIT 1) AND status = 'approved' AND discord_id != ? LIMIT 1"
+  ).bind(myutUrl, session.discord_id).first();
+
+  const imageBuffer = await imageFile.arrayBuffer();
+
+  // Generate temp image ID
+  const tempImageId = uuid();
+
+  // Upload to temp R2
+  await uploadToTemp(env.R2_TEMP, imageBuffer, tempImageId);
+
+  try {
+    // Fetch student data from myut API
+    const studentData = await fetchStudentData(myutUrl);
+
+    // Check NIM uniqueness
+    const nimExists = await env.DB.prepare(
+      "SELECT discord_id FROM verify_attempts WHERE nim = ? AND status = 'approved' AND discord_id != ? LIMIT 1"
+    ).bind(studentData.nim, session.discord_id).first();
+
+    if (nimExists) {
+      // Save failed attempt
+      await env.DB.prepare(
+        "INSERT INTO verify_attempts (id, discord_id, discord_username, status, temp_image_id, nim, nama, study_program, ut_region, class_of, myut_url) VALUES (?, ?, ?, 'failed', ?, ?, ?, ?, ?, ?, ?)"
+      ).bind(uuid(), session.discord_id, session.discord_username, tempImageId, studentData.nim, studentData.nama, studentData.studyProgram, studentData.utRegion, studentData.classOf, myutUrl).run();
+
+      return Response.json({ error: 'This NIM is already associated with another verified account.' }, { status: 409 });
+    }
+
+    // Upload to permanent R2
+    const permKey = await uploadToPerm(env.R2_PERM, imageBuffer, studentData.nim);
+
+    // Save approved attempt
+    const attemptId = uuid();
+    await env.DB.prepare(
+      "INSERT INTO verify_attempts (id, discord_id, discord_username, status, temp_image_id, nim, nama, study_program, ut_region, class_of, myut_url, ektm_image_url, verified_at) VALUES (?, ?, ?, 'approved', ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))"
+    ).bind(attemptId, session.discord_id, session.discord_username, tempImageId, studentData.nim, studentData.nama, studentData.studyProgram, studentData.utRegion, studentData.classOf, myutUrl, permKey).run();
+
+    // Mark session as used
+    await env.DB.prepare("UPDATE sessions SET status = 'used' WHERE id = ?").bind(sessionId).run();
+
+    // Assign role + send DM (fire and forget — don't block response)
+    const token = env.DISCORD_BOT_TOKEN;
+    const guildId = env.DISCORD_GUILD_ID;
+    const roleId = env.VERIFIED_ROLE_ID;
+
+    ctx.waitUntil(
+      (async () => {
+        await assignRole(guildId, session.discord_id, roleId, token);
+        await sendDM(session.discord_id, `Verification successful! ✓\nNIM: ${studentData.nim}\nNama: ${studentData.nama}\nStudy Program: ${studentData.studyProgram}\nUT Region: ${studentData.utRegion}\nClass Of: ${studentData.classOf}`, token);
+      })()
+    );
+
+    return Response.json({
+      success: true,
+      data: studentData,
+    });
+
+  } catch (error) {
+    // Save failed attempt
+    await env.DB.prepare(
+      "INSERT INTO verify_attempts (id, discord_id, discord_username, status, temp_image_id, myut_url) VALUES (?, ?, ?, 'failed', ?, ?)"
+    ).bind(uuid(), session.discord_id, session.discord_username, tempImageId, myutUrl).run();
+
+    return Response.json({ error: `Failed to verify: ${error.message}` }, { status: 500 });
+  }
+}
+
+async function handleRegisterCommands(request, env) {
+  const commands = [
+    { name: 'verify', description: 'Verify your UT student identity' },
+    { name: 'status', description: 'Check your verification status' },
+  ];
+
+  const res = await discordAPI(`/applications/${env.DISCORD_APPLICATION_ID}/commands`, 'PUT', env.DISCORD_BOT_TOKEN, commands);
+  const data = await res.json();
+  return Response.json(data);
+}
+
+// ── Verification page HTML ──
+
+function getVerificationHTML(sessionId) {
+  return `<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>UT Student Verification</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #1a1a2e; color: #eee; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+.container { max-width: 480px; width: 100%; padding: 24px; }
+h1 { font-size: 1.5rem; margin-bottom: 8px; }
+p { color: #aaa; margin-bottom: 24px; font-size: 0.9rem; line-height: 1.5; }
+.upload-area { border: 2px dashed #444; border-radius: 12px; padding: 40px 20px; text-align: center; cursor: pointer; transition: border-color 0.2s; }
+.upload-area:hover, .upload-area.dragover { border-color: #5865F2; }
+.upload-area svg { width: 48px; height: 48px; margin-bottom: 12px; fill: #5865F2; }
+.upload-area .label { font-size: 1rem; margin-bottom: 4px; }
+.upload-area .hint { font-size: 0.8rem; color: #666; }
+input[type="file"] { display: none; }
+.btn { display: block; width: 100%; padding: 14px; border: none; border-radius: 8px; font-size: 1rem; font-weight: 600; cursor: pointer; margin-top: 16px; }
+.btn-primary { background: #5865F2; color: #fff; }
+.btn-primary:disabled { background: #333; color: #666; cursor: not-allowed; }
+.status { margin-top: 20px; padding: 16px; border-radius: 8px; display: none; }
+.status.success { display: block; background: #1a3a1a; border: 1px solid #2d5a2d; }
+.status.error { display: block; background: #3a1a1a; border: 1px solid #5a2d2d; }
+.status h3 { margin-bottom: 8px; }
+.student-data { margin-top: 12px; }
+.student-data div { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid #333; font-size: 0.9rem; }
+.student-data .label { color: #888; }
+.preview { max-width: 200px; max-height: 200px; margin: 16px auto 0; border-radius: 8px; display: none; }
+.loading { display: none; text-align: center; margin-top: 16px; }
+.loading.show { display: block; }
+.spinner { border: 3px solid #333; border-top: 3px solid #5865F2; border-radius: 50%; width: 32px; height: 32px; animation: spin 1s linear infinite; margin: 0 auto 8px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>UT Student Verification</h1>
+  <p>Upload a screenshot of your digital eKTM from myut.ut.ac.id. The QR code will be read to verify your identity.</p>
+
+  <div class="upload-area" id="uploadArea">
+    <svg viewBox="0 0 24 24"><path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg>
+    <div class="label">Click or drag to upload eKTM image</div>
+    <div class="hint">PNG, JPG, or WebP accepted</div>
+  </div>
+  <input type="file" id="fileInput" accept="image/*">
+
+  <img class="preview" id="preview" alt="Preview">
+
+  <button class="btn btn-primary" id="verifyBtn" disabled>Verify</button>
+
+  <div class="loading" id="loading">
+    <div class="spinner"></div>
+    <div>Processing verification...</div>
+  </div>
+
+  <div class="status" id="status"></div>
+</div>
+
+<script>
+const sessionId = '${sessionId}';
+const MYUT_PATTERN = /^https:\\/\\/myut\\.ut\\.ac\\.id\\/e\\/[a-f0-9]{32}$/;
+const OLD_PATTERN = /^https?:\\/\\/webservice\\.ut\\.web\\.id\\/dp\\.php\\?id=\\d+$/;
+
+const uploadArea = document.getElementById('uploadArea');
+const fileInput = document.getElementById('fileInput');
+const preview = document.getElementById('preview');
+const verifyBtn = document.getElementById('verifyBtn');
+const loading = document.getElementById('loading');
+const status = document.getElementById('status');
+
+let myutUrl = null;
+let webpBlob = null;
+
+uploadArea.addEventListener('click', () => fileInput.click());
+uploadArea.addEventListener('dragover', (e) => { e.preventDefault(); uploadArea.classList.add('dragover'); });
+uploadArea.addEventListener('dragleave', () => uploadArea.classList.remove('dragover'));
+uploadArea.addEventListener('drop', (e) => { e.preventDefault(); uploadArea.classList.remove('dragover'); if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]); });
+fileInput.addEventListener('change', () => { if (fileInput.files[0]) handleFile(fileInput.files[0]); });
+
+async function handleFile(file) {
+  status.className = 'status';
+  status.style.display = 'none';
+  myutUrl = null;
+  webpBlob = null;
+  verifyBtn.disabled = true;
+
+  // Show preview
+  const img = new Image();
+  img.onload = async () => {
+    preview.src = img.src;
+    preview.style.display = 'block';
+
+    // Decode QR
+    const canvas = document.createElement('canvas');
+    canvas.width = img.width;
+    canvas.height = img.height;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(img, 0, 0);
+
+    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const code = jsQR(imageData.data, imageData.width, imageData.height);
+
+    if (!code) {
+      showError('Could not read QR code from the image. Please ensure the QR code is clearly visible.');
+      return;
+    }
+
+    const decoded = code.data.trim();
+
+    if (MYUT_PATTERN.test(decoded)) {
+      myutUrl = decoded;
+    } else if (OLD_PATTERN.test(decoded)) {
+      showError('That QR code is from a physical student card, which is not supported. Please upload a screenshot of your digital eKTM from myut.ut.ac.id instead.');
+      return;
+    } else {
+      showError('Invalid QR code. The QR code does not contain a valid myut.ut.ac.id link.');
+      return;
+    }
+
+    // Convert to WebP
+    const maxSize = 1200;
+    let w = img.width, h = img.height;
+    if (w > maxSize) { h = Math.round(h * maxSize / w); w = maxSize; }
+
+    const webpCanvas = document.createElement('canvas');
+    webpCanvas.width = w;
+    webpCanvas.height = h;
+    const webpCtx = webpCanvas.getContext('2d');
+    webpCtx.drawImage(img, 0, 0, w, h);
+
+    webpCanvas.toBlob((blob) => {
+      webpBlob = blob || new Blob([], { type: 'image/webp' });
+      verifyBtn.disabled = false;
+    }, 'image/webp', 0.7);
+  };
+  img.src = URL.createObjectURL(file);
+}
+
+verifyBtn.addEventListener('click', async () => {
+  if (!myutUrl || !webpBlob) return;
+
+  verifyBtn.disabled = true;
+  loading.classList.add('show');
+  status.className = 'status';
+  status.style.display = 'none';
+
+  const formData = new FormData();
+  formData.append('myutUrl', myutUrl);
+  formData.append('image', webpBlob, 'ektm.webp');
+
+  try {
+    const res = await fetch('/v/' + sessionId, { method: 'POST', body: formData });
+    const data = await res.json();
+
+    loading.classList.remove('show');
+
+    if (data.success) {
+      status.className = 'status success';
+      status.innerHTML = '<h3>Verification Successful! ✓</h3><p>You have been verified and assigned the Verified role in Discord.</p><div class="student-data">' +
+        '<div><span class="label">NIM</span><span>' + data.data.nim + '</span></div>' +
+        '<div><span class="label">Nama</span><span>' + data.data.nama + '</span></div>' +
+        '<div><span class="label">Study Program</span><span>' + data.data.studyProgram + '</span></div>' +
+        '<div><span class="label">UT Region</span><span>' + data.data.utRegion + '</span></div>' +
+        '<div><span class="label">Class Of</span><span>' + data.data.classOf + '</span></div>' +
+        '</div>';
+      uploadArea.style.display = 'none';
+      preview.style.display = 'none';
+      verifyBtn.style.display = 'none';
+    } else {
+      showError(data.error || 'Verification failed.');
+    }
+  } catch (e) {
+    loading.classList.remove('show');
+    showError('Network error. Please try again.');
+  }
+});
+
+function showError(msg) {
+  status.className = 'status error';
+  status.innerHTML = '<h3>Verification Failed</h3><p>' + msg + '</p>';
+  verifyBtn.disabled = false;
+}
+</script>
+<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
+</body>
+</html>`;
+}
+
+// ── Admin auth helpers ──
+
+const JWT_SECRET_KEY = 'JWT_SECRET'; // env key name
+
+async function createAdminJWT(email, env) {
+  const header = btoa(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
+  const payload = btoa(JSON.stringify({ email, exp: Date.now() + 86400000 }));
+  const data = new TextEncoder().encode(`${header}.${payload}`);
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(env.JWT_SECRET), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = await crypto.subtle.sign('HMAC', key, data);
+  return `${header}.${payload}.${btoa(String.fromCharCode(...new Uint8Array(sig)))}`;
+}
+
+async function verifyAdminJWT(token, env) {
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 3) return null;
+    const data = new TextEncoder().encode(`${parts[0]}.${parts[1]}`);
+    const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(env.JWT_SECRET), { name: 'HMAC', hash: 'SHA-256' }, false, ['verify']);
+    const sig = Uint8Array.from(atob(parts[2]), c => c.charCodeAt(0));
+    const valid = await crypto.subtle.verify('HMAC', key, sig, data);
+    if (!valid) return null;
+    const payload = JSON.parse(atob(parts[1]));
+    if (payload.exp < Date.now()) return null;
+    return payload.email;
+  } catch { return null; }
+}
+
+async function isAdmin(email, db) {
+  const admin = await db.prepare('SELECT email FROM admins WHERE email = ?').bind(email.toLowerCase()).first();
+  return !!admin;
+}
+
+function getAdminToken(request) {
+  const auth = request.headers.get('Authorization');
+  if (auth?.startsWith('Bearer ')) return auth.slice(7);
+  return null;
+}
+
+// ── Admin route handlers ──
+
+async function handleAdminLogin(request, env) {
+  const { email } = await request.json();
+  if (!email) return Response.json({ error: 'Email required' }, { status: 400 });
+
+  const normalized = email.toLowerCase().trim();
+  if (!(await isAdmin(normalized, env.DB))) {
+    return Response.json({ error: 'Not an admin' }, { status: 403 });
+  }
+
+  const token = await createAdminJWT(normalized, env);
+  return Response.json({ token });
+}
+
+async function handleAdminMe(request, env) {
+  const email = await verifyAdminJWT(getAdminToken(request), env);
+  if (!email) return Response.json({ error: 'Unauthorized' }, { status: 401 });
+  return Response.json({ email });
+}
+
+async function handleAdminListAdmins(request, env) {
+  const email = await verifyAdminJWT(getAdminToken(request), env);
+  if (!email) return Response.json({ error: 'Unauthorized' }, { status: 401 });
+  const { results } = await env.DB.prepare('SELECT email, invited_by, created_at FROM admins ORDER BY created_at').all();
+  return Response.json({ admins: results });
+}
+
+async function handleAdminInviteAdmin(request, env) {
+  const email = await verifyAdminJWT(getAdminToken(request), env);
+  if (!email) return Response.json({ error: 'Unauthorized' }, { status: 401 });
+  const { inviteEmail } = await request.json();
+  if (!inviteEmail) return Response.json({ error: 'Email required' }, { status: 400 });
+
+  const normalized = inviteEmail.toLowerCase().trim();
+  const existing = await env.DB.prepare('SELECT email FROM admins WHERE email = ?').bind(normalized).first();
+  if (existing) return Response.json({ error: 'Already an admin' }, { status: 409 });
+
+  await env.DB.prepare('INSERT INTO admins (id, email, invited_by) VALUES (?, ?, ?)').bind(uuid(), normalized, email).run();
+  return Response.json({ success: true, email: normalized });
+}
+
+async function handleAdminDeleteAdmin(request, env) {
+  const email = await verifyAdminJWT(getAdminToken(request), env);
+  if (!email) return Response.json({ error: 'Unauthorized' }, { status: 401 });
+  const { deleteEmail } = await request.json();
+  if (!deleteEmail) return Response.json({ error: 'Email required' }, { status: 400 });
+
+  const normalized = deleteEmail.toLowerCase().trim();
+  if (normalized === email) return Response.json({ error: 'Cannot delete yourself' }, { status: 400 });
+  if (normalized === 'krismyid@gmail.com') return Response.json({ error: 'Cannot delete default admin' }, { status: 400 });
+
+  const result = await env.DB.prepare('DELETE FROM admins WHERE email = ?').bind(normalized).run();
+  if (!result.meta.changes) return Response.json({ error: 'Admin not found' }, { status: 404 });
+  return Response.json({ success: true });
+}
+
+async function handleAdminListAttempts(request, env) {
+  const email = await verifyAdminJWT(getAdminToken(request), env);
+  if (!email) return Response.json({ error: 'Unauthorized' }, { status: 401 });
+
+  const url = new URL(request.url);
+  const filter = url.searchParams.get('filter') || 'all';
+  let whereClause = '';
+
+  if (filter === 'mtd') {
+    whereClause = "WHERE verified_at >= datetime('now', 'start of month')";
+  } else if (filter === 'month') {
+    whereClause = "WHERE verified_at >= datetime('now', '-30 days')";
+  } else if (filter === 'year') {
+    whereClause = "WHERE verified_at >= datetime('now', '-365 days')";
+  }
+
+  const { results } = await env.DB.prepare(
+    `SELECT id, discord_id, discord_username, status, nim, nama, study_program, ut_region, class_of, myut_url, temp_image_id, ektm_image_url, created_at, verified_at FROM verify_attempts ${whereClause} ORDER BY created_at DESC LIMIT 1000`
+  ).all();
+
+  return Response.json({ attempts: results });
+}
+
+async function handleAdminExportCSV(request, env) {
+  const email = await verifyAdminJWT(getAdminToken(request), env);
+  if (!email) return Response.json({ error: 'Unauthorized' }, { status: 401 });
+
+  const url = new URL(request.url);
+  const filter = url.searchParams.get('filter') || 'all';
+  let whereClause = '';
+
+  if (filter === 'mtd') {
+    whereClause = "WHERE verified_at >= datetime('now', 'start of month')";
+  } else if (filter === 'month') {
+    whereClause = "WHERE verified_at >= datetime('now', '-30 days')";
+  } else if (filter === 'year') {
+    whereClause = "WHERE verified_at >= datetime('now', '-365 days')";
+  }
+
+  const { results } = await env.DB.prepare(
+    `SELECT discord_id, discord_username, status, nim, nama, study_program, ut_region, class_of, myut_url, created_at, verified_at FROM verify_attempts ${whereClause} ORDER BY created_at DESC`
+  ).all();
+
+  const headers = ['Discord ID', 'Discord Username', 'Status', 'NIM', 'Nama', 'Study Program', 'UT Region', 'Class Of', 'MyUT URL', 'Created At', 'Verified At'];
+  const rows = results.map(r => [r.discord_id, r.discord_username, r.status, r.nim, r.nama, r.study_program, r.ut_region, r.class_of, r.myut_url, r.created_at, r.verified_at]);
+
+  const csv = [headers.join(','), ...rows.map(r => r.map(v => `"${(v || '').replace(/"/g, '""')}"`).join(','))].join('\n');
+
+  return new Response(csv, {
+    headers: {
+      'Content-Type': 'text/csv; charset=utf-8',
+      'Content-Disposition': `attachment; filename="verify-export-${filter}.csv"`,
+    },
+  });
+}
+
+async function handleAdminSignedImageUrl(request, env) {
+  const email = await verifyAdminJWT(getAdminToken(request), env);
+  if (!email) return Response.json({ error: 'Unauthorized' }, { status: 401 });
+
+  const url = new URL(request.url);
+  const key = url.searchParams.get('key');
+  if (!key) return Response.json({ error: 'key parameter required' }, { status: 400 });
+
+  // Get the object from R2 permanent bucket
+  const object = await env.R2_PERM.get(key);
+  if (!object) return Response.json({ error: 'Image not found' }, { status: 404 });
+
+  const headers = new Headers();
+  object.writeHttpMetadata(headers);
+  headers.set('Content-Type', object.httpMetadata?.contentType || 'image/webp');
+  headers.set('Cache-Control', 'private, max-age=300');
+
+  return new Response(object.body, { headers });
+}
+
+// ── Admin dashboard HTML ──
+
+function getAdminHTML() {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>UT Verify Admin</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f0f1a;color:#eee;min-height:100vh}
+.nav{background:#1a1a2e;padding:16px 24px;display:flex;align-items:center;gap:16px;border-bottom:1px solid #2a2a4a}
+.nav h1{font-size:1.1rem;font-weight:600}
+.nav .email{margin-left:auto;color:#888;font-size:0.85rem}
+.nav button{background:#333;border:none;color:#ccc;padding:6px 14px;border-radius:6px;cursor:pointer;font-size:0.85rem}
+.nav button:hover{background:#444}
+.main{max-width:1200px;margin:0 auto;padding:24px}
+.login{max-width:400px;margin:100px auto;padding:32px;background:#1a1a2e;border-radius:12px;text-align:center}
+.login h2{margin-bottom:8px}
+.login p{color:#888;font-size:0.9rem;margin-bottom:20px}
+.login input{width:100%;padding:12px;border:1px solid #333;border-radius:8px;background:#0f0f1a;color:#eee;font-size:1rem;margin-bottom:12px}
+.login button{width:100%;padding:12px;background:#5865F2;color:#fff;border:none;border-radius:8px;font-size:1rem;cursor:pointer}
+.login .error{color:#f44;margin-top:12px;font-size:0.9rem;display:none}
+.tabs{display:flex;gap:8px;margin-bottom:24px}
+.tab{padding:8px 16px;border:1px solid #333;border-radius:8px;cursor:pointer;font-size:0.9rem;background:transparent;color:#aaa}
+.tab.active{background:#5865F2;color:#fff;border-color:#5865F2}
+.panel{display:none}
+.panel.active{display:block}
+.filters{display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap}
+.filter{padding:6px 14px;border:1px solid #333;border-radius:6px;cursor:pointer;font-size:0.85rem;background:transparent;color:#aaa}
+.filter.active{background:#2d2d5a;color:#eee;border-color:#5865F2}
+table{width:100%;border-collapse:collapse;font-size:0.85rem}
+th,td{padding:10px 12px;text-align:left;border-bottom:1px solid #1a1a2e}
+th{color:#888;font-weight:500;position:sticky;top:0;background:#0f0f1a}
+tr:hover{background:#1a1a2e}
+.badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:600}
+.badge.approved{background:#1a3a1a;color:#4a4}
+.badge.failed{background:#3a1a1a;color:#a44}
+.badge.expired{background:#2a2a1a;color:#aa4}
+.view-btn{background:transparent;border:1px solid #5865F2;color:#5865F2;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:0.8rem}
+.view-btn:hover{background:#5865F2;color:#fff}
+.export-btn{padding:8px 16px;background:#2d5a2d;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:0.85rem;margin-left:auto}
+.export-btn:hover{background:#3a7a3a}
+.toolbar{display:flex;align-items:center;gap:8px;margin-bottom:16px}
+.admin-card{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;background:#1a1a2e;border-radius:8px;margin-bottom:8px}
+.admin-card .email{font-size:0.95rem}
+.admin-card .meta{color:#666;font-size:0.8rem}
+.admin-card .del-btn{background:transparent;border:1px solid #a44;color:#a44;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:0.8rem}
+.admin-card .del-btn:hover{background:#a44;color:#fff}
+.admin-card .del-btn:disabled{opacity:0.3;cursor:not-allowed}
+.invite-row{display:flex;gap:8px;margin-bottom:16px}
+.invite-row input{flex:1;padding:10px;border:1px solid #333;border-radius:8px;background:#0f0f1a;color:#eee;font-size:0.9rem}
+.invite-row button{padding:10px 20px;background:#5865F2;color:#fff;border:none;border-radius:8px;cursor:pointer}
+.modal-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.8);z-index:100;align-items:center;justify-content:center}
+.modal-overlay.show{display:flex}
+.modal{background:#1a1a2e;padding:24px;border-radius:12px;max-width:500px;width:90%}
+.modal img{width:100%;border-radius:8px}
+.modal .close{background:transparent;border:none;color:#888;font-size:1.5rem;cursor:pointer;float:right}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:24px}
+.stat{background:#1a1a2e;padding:16px;border-radius:8px;text-align:center}
+.stat .num{font-size:1.8rem;font-weight:700;color:#5865F2}
+.stat .lbl{font-size:0.8rem;color:#888;margin-top:4px}
+</style>
+</head>
+<body>
+
+<div class="login" id="loginPage">
+  <h2>Admin Login</h2>
+  <p>Enter your admin email to continue</p>
+  <input type="email" id="loginEmail" placeholder="admin@example.com">
+  <button onclick="doLogin()">Login</button>
+  <div class="error" id="loginError"></div>
+</div>
+
+<div id="appPage" style="display:none">
+  <div class="nav">
+    <h1>UT Verify Admin</h1>
+    <span class="email" id="adminEmail"></span>
+    <button onclick="doLogout()">Logout</button>
+  </div>
+  <div class="main">
+    <div class="tabs">
+      <div class="tab active" data-tab="dashboard" onclick="switchTab(this)">Dashboard</div>
+      <div class="tab" data-tab="attempts" onclick="switchTab(this)">Verify Attempts</div>
+      <div class="tab" data-tab="admins" onclick="switchTab(this)">Admins</div>
+    </div>
+
+    <div class="panel active" id="panel-dashboard">
+      <div class="stats" id="statsGrid"></div>
+    </div>
+
+    <div class="panel" id="panel-attempts">
+      <div class="toolbar">
+        <div class="filters">
+          <div class="filter active" data-filter="all" onclick="setFilter(this)">All</div>
+          <div class="filter" data-filter="mtd" onclick="setFilter(this)">Month-to-Date</div>
+          <div class="filter" data-filter="month" onclick="setFilter(this)">Last 30 Days</div>
+          <div class="filter" data-filter="year" onclick="setFilter(this)">Last Year</div>
+        </div>
+        <button class="export-btn" onclick="exportCSV()">Export CSV</button>
+      </div>
+      <table>
+        <thead><tr><th>NIM</th><th>Nama</th><th>Study Program</th><th>UT Region</th><th>Discord</th><th>Status</th><th>Verified At</th><th>eKTM</th></tr></thead>
+        <tbody id="attemptsBody"></tbody>
+      </table>
+    </div>
+
+    <div class="panel" id="panel-admins">
+      <div class="invite-row">
+        <input type="email" id="inviteEmail" placeholder="Email to invite">
+        <button onclick="inviteAdmin()">Invite</button>
+      </div>
+      <div id="adminsList"></div>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="imageModal" onclick="this.classList.remove('show')">
+  <div class="modal">
+    <button class="close" onclick="document.getElementById('imageModal').classList.remove('show')">&times;</button>
+    <img id="modalImage" alt="eKTM">
+  </div>
+</div>
+
+<script>
+let token = localStorage.getItem('admin_token');
+let currentFilter = 'all';
+
+if (token) showApp();
+
+async function doLogin() {
+  const email = document.getElementById('loginEmail').value;
+  const err = document.getElementById('loginError');
+  err.style.display = 'none';
+  try {
+    const res = await fetch('/admin/login', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({email}) });
+    const data = await res.json();
+    if (data.token) {
+      token = data.token;
+      localStorage.setItem('admin_token', token);
+      showApp();
+    } else {
+      err.textContent = data.error || 'Login failed';
+      err.style.display = 'block';
+    }
+  } catch(e) { err.textContent = 'Network error'; err.style.display = 'block'; }
+}
+
+function doLogout() {
+  token = null;
+  localStorage.removeItem('admin_token');
+  document.getElementById('appPage').style.display = 'none';
+  document.getElementById('loginPage').style.display = 'block';
+}
+
+function showApp() {
+  document.getElementById('loginPage').style.display = 'none';
+  document.getElementById('appPage').style.display = 'block';
+  fetch('/admin/me', { headers: { 'Authorization': 'Bearer ' + token } })
+    .then(r => r.json())
+    .then(d => { if (d.email) { document.getElementById('adminEmail').textContent = d.email; loadDashboard(); } else doLogout(); });
+}
+
+function switchTab(el) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+  el.classList.add('active');
+  document.getElementById('panel-' + el.dataset.tab).classList.add('active');
+  if (el.dataset.tab === 'dashboard') loadDashboard();
+  if (el.dataset.tab === 'attempts') loadAttempts();
+  if (el.dataset.tab === 'admins') loadAdmins();
+}
+
+function setFilter(el) {
+  document.querySelectorAll('.filter').forEach(f => f.classList.remove('active'));
+  el.classList.add('active');
+  currentFilter = el.dataset.filter;
+  loadAttempts();
+}
+
+async function loadDashboard() {
+  try {
+    const res = await fetch('/admin/attempts?filter=all', { headers: { 'Authorization': 'Bearer ' + token } });
+    const data = await res.json();
+    const attempts = data.attempts || [];
+    const approved = attempts.filter(a => a.status === 'approved');
+    const thisMonth = approved.filter(a => a.verified_at && new Date(a.verified_at) >= new Date(new Date().getFullYear(), new Date().getMonth(), 1));
+    document.getElementById('statsGrid').innerHTML =
+      '<div class="stat"><div class="num">' + attempts.length + '</div><div class="lbl">Total Attempts</div></div>' +
+      '<div class="stat"><div class="num">' + approved.length + '</div><div class="lbl">Verified</div></div>' +
+      '<div class="stat"><div class="num">' + thisMonth.length + '</div><div class="lbl">This Month</div></div>' +
+      '<div class="stat"><div class="num">' + attempts.filter(a => a.status === 'failed').length + '</div><div class="lbl">Failed</div></div>';
+  } catch(e) {}
+}
+
+async function loadAttempts() {
+  try {
+    const res = await fetch('/admin/attempts?filter=' + currentFilter, { headers: { 'Authorization': 'Bearer ' + token } });
+    const data = await res.json();
+    const tbody = document.getElementById('attemptsBody');
+    tbody.innerHTML = (data.attempts || []).map(a =>
+      '<tr>' +
+      '<td>' + (a.nim || '-') + '</td>' +
+      '<td>' + (a.nama || '-') + '</td>' +
+      '<td>' + (a.study_program || '-') + '</td>' +
+      '<td>' + (a.ut_region || '-') + '</td>' +
+      '<td>' + a.discord_username + '</td>' +
+      '<td><span class="badge ' + a.status + '">' + a.status + '</span></td>' +
+      '<td>' + (a.verified_at || '-') + '</td>' +
+      '<td>' + (a.ektm_image_url ? '<button class="view-btn" onclick="viewImage(\\'' + a.ektm_image_url + '\\')">View</button>' : '-') + '</td>' +
+      '</tr>'
+    ).join('');
+  } catch(e) {}
+}
+
+async function loadAdmins() {
+  try {
+    const res = await fetch('/admin/admins', { headers: { 'Authorization': 'Bearer ' + token } });
+    const data = await res.json();
+    const me = document.getElementById('adminEmail').textContent;
+    document.getElementById('adminsList').innerHTML = (data.admins || []).map(a =>
+      '<div class="admin-card">' +
+      '<div><div class="email">' + a.email + '</div>' +
+      (a.invited_by ? '<div class="meta">Invited by ' + a.invited_by + '</div>' : '<div class="meta">Default admin</div>') +
+      '</div>' +
+      '<button class="del-btn" onclick="deleteAdmin(\\'' + a.email + '\\', this)"' +
+      (a.email === me || a.email === 'krismyid@gmail.com' ? ' disabled' : '') +
+      '>Delete</button>' +
+      '</div>'
+    ).join('');
+  } catch(e) {}
+}
+
+async function inviteAdmin() {
+  const email = document.getElementById('inviteEmail').value;
+  if (!email) return;
+  try {
+    const res = await fetch('/admin/invite', { method: 'POST', headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' }, body: JSON.stringify({ inviteEmail: email }) });
+    const data = await res.json();
+    if (data.success) { document.getElementById('inviteEmail').value = ''; loadAdmins(); }
+    else alert(data.error || 'Failed to invite');
+  } catch(e) { alert('Network error'); }
+}
+
+async function deleteAdmin(email, btn) {
+  if (!confirm('Remove admin ' + email + '?')) return;
+  try {
+    const res = await fetch('/admin/delete', { method: 'POST', headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' }, body: JSON.stringify({ deleteEmail: email }) });
+    const data = await res.json();
+    if (data.success) loadAdmins();
+    else alert(data.error || 'Failed to delete');
+  } catch(e) { alert('Network error'); }
+}
+
+function viewImage(key) {
+  document.getElementById('modalImage').src = '/admin/image?key=' + encodeURIComponent(key);
+  document.getElementById('imageModal').classList.add('show');
+}
+
+function exportCSV() {
+  window.open('/admin/export?filter=' + currentFilter, '_blank');
+}
+</script>
+</body>
+</html>`;
+}
+
+// ── Main router ──
+
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+
+    // Discord Interactions
+    if (request.method === 'POST' && path === '/interactions') {
+      return handleInteraction(request, env);
+    }
+
+    // Register slash commands (one-time setup)
+    if (request.method === 'POST' && path === '/register-commands') {
+      return handleRegisterCommands(request, env);
+    }
+
+    // Admin dashboard
+    if (path === '/admin' || path === '/admin/') {
+      return new Response(getAdminHTML(), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+    }
+
+    // Admin API routes
+    if (path === '/admin/login' && request.method === 'POST') {
+      return handleAdminLogin(request, env);
+    }
+    if (path === '/admin/me' && request.method === 'GET') {
+      return handleAdminMe(request, env);
+    }
+    if (path === '/admin/admins' && request.method === 'GET') {
+      return handleAdminListAdmins(request, env);
+    }
+    if (path === '/admin/invite' && request.method === 'POST') {
+      return handleAdminInviteAdmin(request, env);
+    }
+    if (path === '/admin/delete' && request.method === 'POST') {
+      return handleAdminDeleteAdmin(request, env);
+    }
+    if (path === '/admin/attempts' && request.method === 'GET') {
+      return handleAdminListAttempts(request, env);
+    }
+    if (path === '/admin/export' && request.method === 'GET') {
+      return handleAdminExportCSV(request, env);
+    }
+    if (path === '/admin/image' && request.method === 'GET') {
+      return handleAdminSignedImageUrl(request, env);
+    }
+
+    // Verification page
+    const verifyMatch = path.match(/^\/v\/([a-f0-9-]+)$/);
+    if (verifyMatch) {
+      if (request.method === 'GET') {
+        return handleVerificationPage(verifyMatch[1], env);
+      }
+      if (request.method === 'POST') {
+        return processVerification(verifyMatch[1], request, env, ctx);
+      }
+    }
+
+    return new Response('Not found', { status: 404 });
+  },
+};

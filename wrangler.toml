@@ -1,0 +1,26 @@
+name = "discord-ut-verify"
+main = "src/worker.js"
+compatibility_date = "2024-12-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "discord-ut-verify"
+database_id = ""
+
+[[r2_buckets]]
+binding = "R2_TEMP"
+bucket_name = "ektm-temp"
+
+[[r2_buckets]]
+binding = "R2_PERM"
+bucket_name = "ektm-images"
+
+[vars]
+DISCORD_PUBLIC_KEY = ""
+DISCORD_APPLICATION_ID = ""
+DISCORD_GUILD_ID = ""
+VERIFIED_ROLE_ID = ""
+
+# Set secrets via: wrangler secret put <NAME>
+# DISCORD_BOT_TOKEN
+# JWT_SECRET

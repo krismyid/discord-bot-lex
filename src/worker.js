@@ -2026,45 +2026,37 @@ async function loadAttempts() {
     jumpInput.max = pag.totalPages;
 
     // Render page numbers (show up to 7 pages around current)
-    function renderPageNumbers() {
-      const container = document.getElementById('pageNumbers');
-      const pages = [];
-      const showEllipsis = (arr, val) => {
-        const last = arr[arr.length - 1];
-        if (last && last !== val - 1 && last !== '...') {
-          arr.push('...');
-        }
-      };
+    const container = document.getElementById('pageNumbers');
+    const pages = [];
 
-      // First page
-      if (pag.totalPages >= 1) pages.push(1);
+    // First page
+    if (pag.totalPages >= 1) pages.push(1);
 
-      // Pages around current
-      const rangeStart = Math.max(2, pag.page - 2);
-      const rangeEnd = Math.min(pag.totalPages - 1, pag.page + 2);
+    // Pages around current
+    const rangeStart = Math.max(2, pag.page - 2);
+    const rangeEnd = Math.min(pag.totalPages - 1, pag.page + 2);
 
-      if (rangeStart <= rangeEnd) {
-        showEllipsis(pages, rangeStart);
-        for (let i = rangeStart; i <= rangeEnd; i++) pages.push(i);
-      }
-
-      // Last page
-      if (pag.totalPages > 1) {
-        showEllipsis(pages, pag.totalPages);
-        pages.push(pag.totalPages);
-      }
-
-      container.innerHTML = pages.map(p => {
-        if (p === '...') return '<span style="padding:4px 8px;color:#666">...</span>';
-        const isActive = p === pag.page;
-        const style = isActive
-          ? 'background:#5865F2;color:#fff;border-radius:4px;padding:4px 10px;cursor:pointer;font-size:0.9rem;text-decoration:none'
-          : 'background:#1a1a2e;color:#888;border-radius:4px;padding:4px 10px;cursor:pointer;font-size:0.9rem;text-decoration:none';
-        return '<span style="' + style + '" onclick="goToPage(' + p + ')">' + p + '</span>';
-      }).join('');
+    if (rangeStart <= rangeEnd) {
+      const last = pages[pages.length - 1];
+      if (last && last !== rangeStart - 1 && last !== '...') pages.push('...');
+      for (let i = rangeStart; i <= rangeEnd; i++) pages.push(i);
     }
 
-    renderPageNumbers();
+    // Last page
+    if (pag.totalPages > 1) {
+      const last = pages[pages.length - 1];
+      if (last && last !== pag.totalPages - 1 && last !== '...') pages.push('...');
+      pages.push(pag.totalPages);
+    }
+
+    container.innerHTML = pages.map(p => {
+      if (p === '...') return '<span style="padding:4px 8px;color:#666">...</span>';
+      const isActive = p === pag.page;
+      const style = isActive
+        ? 'background:#5865F2;color:#fff;border-radius:4px;padding:4px 10px;cursor:pointer;font-size:0.9rem;text-decoration:none'
+        : 'background:#1a1a2e;color:#888;border-radius:4px;padding:4px 10px;cursor:pointer;font-size:0.9rem;text-decoration:none';
+      return '<span style="' + style + '" onclick="goToPage(' + p + ')">' + p + '</span>';
+    }).join('');
   } catch(e) {}
 }
 

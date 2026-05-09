@@ -35,3 +35,6 @@ dist/
 
 # Sample data
 sample/
+
+# Claude Code (local user settings)
+.claude/settings.local.json

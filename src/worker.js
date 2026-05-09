@@ -662,6 +662,115 @@ function fromBase64(str) {
   return Uint8Array.from(atob(str), c => c.charCodeAt(0)).buffer;
 }
 
+function toHex(buf) {
+  return Array.from(new Uint8Array(buf), b => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function sha256(text) {
+  const encoder = new TextEncoder();
+  const data = encoder.encode(text);
+  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+  return toBase64(hashBuffer);
+}
+
+const TOKEN_EXPIRE_HOURS = 24;
+const MAILGUN_DOMAIN = 'mg.kris.my.id';
+const MAILGUN_API_BASE = 'https://api.eu.mailgun.net/v3';
+const MAIL_FROM = 'lexcriminalis@mg.kris.my.id';
+
+async function sendMail(env, to, subject, html, text) {
+  const apiKey = env.MAILGUN_API_KEY;
+  if (!apiKey) return { ok: false, error: 'MAILGUN_API_KEY not configured' };
+
+  const formData = new FormData();
+  formData.append('from', MAIL_FROM);
+  formData.append('to', to);
+  formData.append('subject', subject);
+  formData.append('html', html);
+  formData.append('text', text);
+
+  const url = `${MAILGUN_API_BASE}/${MAILGUN_DOMAIN}/messages`;
+  const credentials = btoa(`api:${apiKey}`);
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Basic ${credentials}`,
+    },
+    body: formData,
+  });
+
+  if (!res.ok) {
+    const errText = await res.text().catch(() => '');
+    return { ok: false, error: `Mailgun API ${res.status}: ${errText}` };
+  }
+
+  return { ok: true };
+}
+
+async function generateAdminToken(db, adminEmail, tokenType) {
+  const rawTokenBytes = crypto.getRandomValues(new Uint8Array(32));
+  const rawToken = toHex(rawTokenBytes);
+  const tokenHash = await sha256(rawToken);
+
+  const id = uuid();
+  const expiresAt = new Date(Date.now() + TOKEN_EXPIRE_HOURS * 60 * 60 * 1000).toISOString();
+
+  await db.prepare(
+    'INSERT INTO admin_tokens (id, admin_email, token_hash, token_type, used, expires_at) VALUES (?, ?, ?, ?, 0, ?)'
+  ).bind(id, adminEmail, tokenHash, tokenType, expiresAt).run();
+
+  return rawToken;
+}
+
+async function redeemAdminToken(db, rawToken) {
+  const tokenHash = await sha256(rawToken);
+
+  const token = await db.prepare(
+    "SELECT id, admin_email, token_type, used, expires_at FROM admin_tokens WHERE token_hash = ? AND used = 0 AND datetime('now') < datetime(expires_at) LIMIT 1"
+  ).bind(tokenHash).first();
+
+  if (!token) return null;
+
+  await db.prepare("UPDATE admin_tokens SET used = 1 WHERE id = ?").bind(token.id).run();
+
+  return { adminEmail: token.admin_email, tokenType: token.token_type };
+}
+
+function makeEmailHtml(heading, message, link, buttonText) {
+  return `<!DOCTYPE html>
+<html><body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f4f4f5; padding: 40px 20px;">
+  <div style="max-width: 480px; background: #fff; padding: 40px; border-radius: 12px; margin: 0 auto;">
+    <h2 style="margin: 0 0 16px 0; font-size: 1.4rem; color: #18181b;">${heading}</h2>
+    <p style="margin: 0 0 24px 0; color: #52525b; line-height: 1.5;">${message}</p>
+    <div style="text-align: center; margin: 24px 0;">
+      <a href="${link}" style="display: inline-block; padding: 14px 32px; background: #5865F2; color: #fff; text-decoration: none; border-radius: 8px; font-weight: 600;">${buttonText}</a>
+    </div>
+    <p style="margin: 16px 0 0 0; color: #a1a1aa; font-size: 0.85rem; line-height: 1.4;">
+      Or copy and paste this link:<br>
+      <span style="word-break: break-all;">${link}</span>
+    </p>
+    <p style="margin: 24px 0 0 0; color: #a1a1aa; font-size: 0.8rem;">
+      This link expires in ${TOKEN_EXPIRE_HOURS} hours.<br>
+      Lex Studyhub Admin
+    </p>
+  </div>
+</body></html>`;
+}
+
+function makeEmailText(heading, message, link, buttonText) {
+  return `${heading}
+
+${message}
+
+${buttonText}: ${link}
+
+This link expires in ${TOKEN_EXPIRE_HOURS} hours.
+
+Lex Studyhub Admin
+`;
+}
+
 async function hashPassword(password) {
   const salt = crypto.getRandomValues(new Uint8Array(PBKDF2_SALT_LEN));
   const encoder = new TextEncoder();
@@ -781,7 +890,7 @@ async function handleAdminListAdmins(request, env) {
   return Response.json({ admins: results });
 }
 
-async function handleAdminInviteAdmin(request, env) {
+async function handleAdminInviteAdmin(request, env, ctx) {
   const email = await verifyAdminJWT(getAdminToken(request), env);
   if (!email) return Response.json({ error: 'Unauthorized' }, { status: 401 });
   const { inviteEmail } = await request.json();
@@ -792,7 +901,193 @@ async function handleAdminInviteAdmin(request, env) {
   if (existing) return Response.json({ error: 'Already an admin' }, { status: 409 });
 
   await env.DB.prepare('INSERT INTO admins (id, email, invited_by) VALUES (?, ?, ?)').bind(uuid(), normalized, email).run();
-  return Response.json({ success: true, email: normalized });
+
+  const token = await generateAdminToken(env.DB, normalized, 'invite');
+  const reqUrl = new URL(request.url);
+  const setPasswordUrl = `${reqUrl.protocol}//${reqUrl.host}/admin/set-password?token=${token}`;
+
+  const subject = 'You\'ve been invited as an admin';
+  const heading = 'You\'re invited!';
+  const message = `You've been invited to administer the UT Verification Discord bot. Click the button below to set your password.`;
+  const buttonText = 'Set Your Password';
+  const html = makeEmailHtml(heading, message, setPasswordUrl, buttonText);
+  const text = makeEmailText(heading, message, setPasswordUrl, buttonText);
+
+  const mailResult = await sendMail(env, normalized, subject, html, text);
+
+  return Response.json({
+    success: true,
+    email: normalized,
+    emailSent: mailResult.ok,
+    emailError: mailResult.error || null,
+  });
+}
+
+async function handleAdminForgotPassword(request, env) {
+  const { email } = await request.json();
+  if (!email) return Response.json({ error: 'Email required' }, { status: 400 });
+
+  const normalized = email.toLowerCase().trim();
+  const admin = await env.DB.prepare('SELECT email FROM admins WHERE email = ?').bind(normalized).first();
+
+  if (!admin) {
+    return Response.json({ success: true, emailSent: false, reason: 'No such admin' });
+  }
+
+  const token = await generateAdminToken(env.DB, normalized, 'reset');
+  const reqUrl = new URL(request.url);
+  const resetUrl = `${reqUrl.protocol}//${reqUrl.host}/admin/set-password?token=${token}`;
+
+  const subject = 'Reset your admin password';
+  const heading = 'Password Reset';
+  const message = 'Click the button below to reset your admin password. If you didn\'t request this, you can safely ignore this email.';
+  const buttonText = 'Reset Password';
+  const html = makeEmailHtml(heading, message, resetUrl, buttonText);
+  const text = makeEmailText(heading, message, resetUrl, buttonText);
+
+  const mailResult = await sendMail(env, normalized, subject, html, text);
+
+  return Response.json({
+    success: true,
+    emailSent: mailResult.ok,
+    emailError: mailResult.error || null,
+  });
+}
+
+async function handleAdminSetPasswordPage(request, env) {
+  const url = new URL(request.url);
+  const token = url.searchParams.get('token');
+
+  if (!token) {
+    return new Response('Invalid or missing token.', { status: 400, headers: { 'Content-Type': 'text/plain' } });
+  }
+
+  const html = getSetPasswordHTML(token);
+  return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+}
+
+async function handleAdminSetPassword(request, env) {
+  const { token, newPassword } = await request.json();
+  if (!token || !newPassword) {
+    return Response.json({ error: 'Token and newPassword required' }, { status: 400 });
+  }
+
+  if (newPassword.length < 8) {
+    return Response.json({ error: 'Password must be at least 8 characters' }, { status: 400 });
+  }
+
+  const redemption = await redeemAdminToken(env.DB, token);
+  if (!redemption) {
+    return Response.json({ error: 'Invalid or expired token' }, { status: 400 });
+  }
+
+  const newHash = await hashPassword(newPassword);
+  await env.DB.prepare(
+    'UPDATE admins SET password_hash = ? WHERE email = ?'
+  ).bind(newHash, redemption.adminEmail).run();
+
+  return Response.json({ success: true, tokenType: redemption.tokenType });
+}
+
+function getSetPasswordHTML(token) {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Set Admin Password</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f0f1a;color:#eee;min-height:100vh;display:flex;align-items:center;justify-content:center}
+.login{max-width:400px;padding:32px;background:#1a1a2e;border-radius:12px;text-align:center}
+.login h2{margin-bottom:8px}
+.login p{color:#888;font-size:0.9rem;margin-bottom:20px}
+.login input{width:100%;padding:12px;border:1px solid #333;border-radius:8px;background:#0f0f1a;color:#eee;font-size:1rem;margin-bottom:12px}
+.login button{width:100%;padding:12px;background:#5865F2;color:#fff;border:none;border-radius:8px;font-size:1rem;cursor:pointer}
+.login button:disabled{background:#333;color:#666;cursor:not-allowed}
+.login .error{color:#f44;margin-top:12px;font-size:0.9rem;display:none}
+.login .success{color:#4a4;margin-top:12px;font-size:0.9rem;display:none}
+.login .link{margin-top:16px}
+.login .link a{color:#5865F2;text-decoration:none}
+</style>
+</head>
+<body>
+
+<div class="login" id="setPasswordPage">
+  <h2>Set Your Password</h2>
+  <p>Choose a new password for your admin account.</p>
+  <input type="password" id="newPwd" placeholder="New Password (min 8 chars)">
+  <input type="password" id="confirmPwd" placeholder="Confirm New Password">
+  <button id="setPwdBtn" onclick="doSetPassword()">Set Password</button>
+  <div class="error" id="pwdError"></div>
+  <div class="success" id="pwdSuccess"></div>
+  <div class="link" id="loginLink" style="display:none">
+    <a href="/admin">← Back to Login</a>
+  </div>
+</div>
+
+<script>
+const token = '${token.replace(/'/g, "\\'")}';
+
+async function doSetPassword() {
+  const newPwd = document.getElementById('newPwd').value;
+  const confirmPwd = document.getElementById('confirmPwd').value;
+  const errEl = document.getElementById('pwdError');
+  const okEl = document.getElementById('pwdSuccess');
+  const btn = document.getElementById('setPwdBtn');
+
+  errEl.style.display = 'none';
+  okEl.style.display = 'none';
+
+  if (!newPwd || !confirmPwd) {
+    errEl.textContent = 'Please fill in both password fields.';
+    errEl.style.display = 'block';
+    return;
+  }
+
+  if (newPwd.length < 8) {
+    errEl.textContent = 'Password must be at least 8 characters.';
+    errEl.style.display = 'block';
+    return;
+  }
+
+  if (newPwd !== confirmPwd) {
+    errEl.textContent = 'Passwords do not match.';
+    errEl.style.display = 'block';
+    return;
+  }
+
+  btn.disabled = true;
+
+  try {
+    const res = await fetch('/admin/set-password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token, newPassword: newPwd })
+    });
+    const data = await res.json();
+
+    if (data.success) {
+      okEl.textContent = 'Password set successfully!';
+      okEl.style.display = 'block';
+      document.getElementById('setPwdBtn').style.display = 'none';
+      document.getElementById('newPwd').style.display = 'none';
+      document.getElementById('confirmPwd').style.display = 'none';
+      document.getElementById('loginLink').style.display = 'block';
+    } else {
+      errEl.textContent = data.error || 'Failed to set password.';
+      errEl.style.display = 'block';
+      btn.disabled = false;
+    }
+  } catch (e) {
+    errEl.textContent = 'Network error.';
+    errEl.style.display = 'block';
+    btn.disabled = false;
+  }
+}
+</script>
+</body>
+</html>`;
 }
 
 async function handleAdminDeleteAdmin(request, env) {
@@ -1035,6 +1330,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .login input{width:100%;padding:12px;border:1px solid #333;border-radius:8px;background:#0f0f1a;color:#eee;font-size:1rem;margin-bottom:12px}
 .login button{width:100%;padding:12px;background:#5865F2;color:#fff;border:none;border-radius:8px;font-size:1rem;cursor:pointer}
 .login .error{color:#f44;margin-top:12px;font-size:0.9rem;display:none}
+.login .success{color:#4a4;margin-top:12px;font-size:0.9rem;display:none}
 .tabs{display:flex;gap:8px;margin-bottom:24px}
 .tab{padding:8px 16px;border:1px solid #333;border-radius:8px;cursor:pointer;font-size:0.9rem;background:transparent;color:#aaa}
 .tab.active{background:#5865F2;color:#fff;border-color:#5865F2}
@@ -1103,12 +1399,28 @@ tr:hover{background:#1a1a2e}
 <body>
 
 <div class="login" id="loginPage">
-  <h2>Admin Login</h2>
-  <p>Enter your admin credentials</p>
-  <input type="email" id="loginEmail" placeholder="admin@example.com">
-  <input type="password" id="loginPassword" placeholder="Password">
-  <button onclick="doLogin()">Login</button>
-  <div class="error" id="loginError"></div>
+  <div id="loginForm">
+    <h2>Admin Login</h2>
+    <p>Enter your admin credentials</p>
+    <input type="email" id="loginEmail" placeholder="admin@example.com">
+    <input type="password" id="loginPassword" placeholder="Password">
+    <button onclick="doLogin()">Login</button>
+    <div style="margin-top:16px">
+      <a href="#" onclick="toggleForgotPassword(); return false;" style="color:#5865F2;text-decoration:none;font-size:0.85rem">Forgot Password?</a>
+    </div>
+    <div class="error" id="loginError"></div>
+  </div>
+  <div id="forgotPasswordForm" style="display:none">
+    <h2>Reset Password</h2>
+    <p style="margin-bottom:16px">Enter your email address and we'll send you a link to reset your password.</p>
+    <input type="email" id="forgotEmail" placeholder="admin@example.com">
+    <button onclick="doForgotPassword()">Send Reset Link</button>
+    <div style="margin-top:16px">
+      <a href="#" onclick="toggleForgotPassword(); return false;" style="color:#5865F2;text-decoration:none;font-size:0.85rem">← Back to Login</a>
+    </div>
+    <div class="error" id="forgotError"></div>
+    <div class="success" id="forgotSuccess" style="margin-top:12px;color:#4a4;display:none"></div>
+  </div>
 </div>
 
 <div id="appPage" style="display:none">
@@ -1241,6 +1553,62 @@ function doLogout() {
   localStorage.removeItem('admin_token');
   document.getElementById('appPage').style.display = 'none';
   document.getElementById('loginPage').style.display = 'block';
+  document.getElementById('loginForm').style.display = 'block';
+  document.getElementById('forgotPasswordForm').style.display = 'none';
+}
+
+function toggleForgotPassword() {
+  const loginForm = document.getElementById('loginForm');
+  const forgotForm = document.getElementById('forgotPasswordForm');
+  const loginErr = document.getElementById('loginError');
+  const forgotErr = document.getElementById('forgotError');
+  const forgotOk = document.getElementById('forgotSuccess');
+
+  loginErr.style.display = 'none';
+  forgotErr.style.display = 'none';
+  forgotOk.style.display = 'none';
+
+  if (loginForm.style.display === 'none') {
+    loginForm.style.display = 'block';
+    forgotForm.style.display = 'none';
+  } else {
+    loginForm.style.display = 'none';
+    forgotForm.style.display = 'block';
+  }
+}
+
+async function doForgotPassword() {
+  const email = document.getElementById('forgotEmail').value;
+  const errEl = document.getElementById('forgotError');
+  const okEl = document.getElementById('forgotSuccess');
+  errEl.style.display = 'none';
+  okEl.style.display = 'none';
+
+  if (!email) {
+    errEl.textContent = 'Please enter your email address.';
+    errEl.style.display = 'block';
+    return;
+  }
+
+  try {
+    const res = await fetch('/admin/forgot-password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email })
+    });
+    const data = await res.json();
+
+    if (data.success) {
+      okEl.textContent = 'If this email is registered, you will receive a password reset link shortly.';
+      okEl.style.display = 'block';
+    } else {
+      errEl.textContent = data.error || 'Failed to request reset.';
+      errEl.style.display = 'block';
+    }
+  } catch (e) {
+    errEl.textContent = 'Network error.';
+    errEl.style.display = 'block';
+  }
 }
 
 function showApp() {
@@ -1328,7 +1696,15 @@ async function inviteAdmin() {
   try {
     const res = await fetch('/admin/invite', { method: 'POST', headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' }, body: JSON.stringify({ inviteEmail: email }) });
     const data = await res.json();
-    if (data.success) { document.getElementById('inviteEmail').value = ''; loadAdmins(); }
+    if (data.success) {
+      document.getElementById('inviteEmail').value = '';
+      loadAdmins();
+      if (data.emailSent) {
+        alert('Admin invited! Invitation email sent to ' + data.email);
+      } else {
+        alert('Admin created, but email failed to send. The user will need a password reset link. Error: ' + (data.emailError || 'unknown'));
+      }
+    }
     else alert(data.error || 'Failed to invite');
   } catch(e) { alert('Network error'); }
 }
@@ -1607,7 +1983,16 @@ export default {
       return handleAdminListAdmins(request, env);
     }
     if (path === '/admin/invite' && request.method === 'POST') {
-      return handleAdminInviteAdmin(request, env);
+      return handleAdminInviteAdmin(request, env, ctx);
+    }
+    if (path === '/admin/forgot-password' && request.method === 'POST') {
+      return handleAdminForgotPassword(request, env);
+    }
+    if (path === '/admin/set-password' && request.method === 'GET') {
+      return handleAdminSetPasswordPage(request, env);
+    }
+    if (path === '/admin/set-password' && request.method === 'POST') {
+      return handleAdminSetPassword(request, env);
     }
     if (path === '/admin/delete' && request.method === 'POST') {
       return handleAdminDeleteAdmin(request, env);

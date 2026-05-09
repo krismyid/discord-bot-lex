@@ -364,6 +364,7 @@ async function processVerification(sessionId, request, env, ctx) {
     ctx.waitUntil(
       (async () => {
         await assignRole(guildId, session.discord_id, roleId, token);
+        await assignMajorRoles(guildId, session.discord_id, studentData.studyProgram, token, env.DB);
         await sendDM(session.discord_id, `✓ Verifikasi Berhasil!
 
 Selamat, ${studentData.nama}!
@@ -889,6 +890,127 @@ async function handleAdminSignedImageUrl(request, env) {
   return new Response(object.body, { headers });
 }
 
+// ── Major-role mapping handlers ──
+
+async function assignMajorRoles(guildId, discordId, studyProgram, token, db) {
+  if (!studyProgram) return;
+  const { results } = await db.prepare(
+    'SELECT mt.discord_role_id FROM major_tag_members mtm JOIN major_tags mt ON mtm.tag_id = mt.id WHERE mtm.study_program = ?'
+  ).bind(studyProgram).all();
+  for (const row of results) {
+    await assignRole(guildId, discordId, row.discord_role_id, token);
+  }
+}
+
+async function handleAdminListMajorTags(request, env) {
+  const email = await verifyAdminJWT(getAdminToken(request), env);
+  if (!email) return Response.json({ error: 'Unauthorized' }, { status: 401 });
+
+  const [tagsResult, membersResult] = await Promise.all([
+    env.DB.prepare('SELECT id, name, discord_role_id, created_at FROM major_tags ORDER BY created_at').all(),
+    env.DB.prepare('SELECT tag_id, study_program FROM major_tag_members').all(),
+  ]);
+  const tags = tagsResult.results;
+  const members = membersResult.results;
+
+  const tagMap = {};
+  for (const t of tags) {
+    tagMap[t.id] = { ...t, members: [] };
+  }
+  for (const m of members) {
+    if (tagMap[m.tag_id]) tagMap[m.tag_id].members.push(m.study_program);
+  }
+
+  return Response.json({ tags: Object.values(tagMap) });
+}
+
+async function handleAdminCreateMajorTag(request, env) {
+  const email = await verifyAdminJWT(getAdminToken(request), env);
+  if (!email) return Response.json({ error: 'Unauthorized' }, { status: 401 });
+
+  const { name, discordRoleId } = await request.json();
+  if (!name || !discordRoleId) return Response.json({ error: 'name and discordRoleId required' }, { status: 400 });
+
+  const id = uuid();
+  await env.DB.prepare(
+    'INSERT INTO major_tags (id, name, discord_role_id) VALUES (?, ?, ?)'
+  ).bind(id, name, discordRoleId).run();
+
+  return Response.json({ success: true, id, name, discordRoleId });
+}
+
+async function handleAdminDeleteMajorTag(request, env) {
+  const email = await verifyAdminJWT(getAdminToken(request), env);
+  if (!email) return Response.json({ error: 'Unauthorized' }, { status: 401 });
+
+  const { id } = await request.json();
+  if (!id) return Response.json({ error: 'id required' }, { status: 400 });
+
+  // D1 doesn't enforce FOREIGN KEY ON DELETE CASCADE, so delete members manually
+  await env.DB.prepare('DELETE FROM major_tag_members WHERE tag_id = ?').bind(id).run();
+  await env.DB.prepare('DELETE FROM major_tags WHERE id = ?').bind(id).run();
+
+  return Response.json({ success: true });
+}
+
+async function handleAdminAddMajorMember(request, env, ctx) {
+  const email = await verifyAdminJWT(getAdminToken(request), env);
+  if (!email) return Response.json({ error: 'Unauthorized' }, { status: 401 });
+
+  const { tagId, studyProgram } = await request.json();
+  if (!tagId || !studyProgram) return Response.json({ error: 'tagId and studyProgram required' }, { status: 400 });
+
+  const tag = await env.DB.prepare('SELECT discord_role_id FROM major_tags WHERE id = ?').bind(tagId).first();
+  if (!tag) return Response.json({ error: 'Tag not found' }, { status: 404 });
+
+  await env.DB.prepare(
+    'INSERT OR IGNORE INTO major_tag_members (tag_id, study_program) VALUES (?, ?)'
+  ).bind(tagId, studyProgram).run();
+
+  // Retroactive role assignment
+  const token = env.DISCORD_BOT_TOKEN;
+  const guildId = env.DISCORD_GUILD_ID;
+  const roleId = tag.discord_role_id;
+
+  ctx.waitUntil(
+    (async () => {
+      const { results } = await env.DB.prepare(
+        "SELECT DISTINCT discord_id FROM verify_attempts WHERE study_program = ? AND status = 'approved'"
+      ).bind(studyProgram).all();
+      for (const row of results) {
+        await assignRole(guildId, row.discord_id, roleId, token);
+      }
+    })()
+  );
+
+  return Response.json({ success: true });
+}
+
+async function handleAdminRemoveMajorMember(request, env) {
+  const email = await verifyAdminJWT(getAdminToken(request), env);
+  if (!email) return Response.json({ error: 'Unauthorized' }, { status: 401 });
+
+  const { tagId, studyProgram } = await request.json();
+  if (!tagId || !studyProgram) return Response.json({ error: 'tagId and studyProgram required' }, { status: 400 });
+
+  await env.DB.prepare(
+    'DELETE FROM major_tag_members WHERE tag_id = ? AND study_program = ?'
+  ).bind(tagId, studyProgram).run();
+
+  return Response.json({ success: true });
+}
+
+async function handleAdminUnmappedMajors(request, env) {
+  const email = await verifyAdminJWT(getAdminToken(request), env);
+  if (!email) return Response.json({ error: 'Unauthorized' }, { status: 401 });
+
+  const { results } = await env.DB.prepare(
+    "SELECT study_program, COUNT(*) as count FROM verify_attempts WHERE study_program IS NOT NULL AND status = 'approved' AND study_program NOT IN (SELECT study_program FROM major_tag_members) GROUP BY study_program ORDER BY count DESC"
+  ).all();
+
+  return Response.json({ majors: results });
+}
+
 // ── Admin dashboard HTML ──
 
 function getAdminHTML() {
@@ -952,6 +1074,30 @@ tr:hover{background:#1a1a2e}
 .stat{background:#1a1a2e;padding:16px;border-radius:8px;text-align:center}
 .stat .num{font-size:1.8rem;font-weight:700;color:#5865F2}
 .stat .lbl{font-size:0.8rem;color:#888;margin-top:4px}
+.tag-card{background:#1a1a2e;padding:16px;border-radius:8px;margin-bottom:12px}
+.tag-card .tag-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+.tag-card .tag-name{font-size:1.05rem;font-weight:600}
+.tag-card .tag-role{color:#5865F2;font-size:0.85rem;margin-top:2px}
+.tag-card .del-tag-btn{background:transparent;border:1px solid #a44;color:#a44;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:0.8rem}
+.tag-card .del-tag-btn:hover{background:#a44;color:#fff}
+.tag-card .member{display:flex;align-items:center;justify-content:space-between;padding:6px 10px;background:#0f0f1a;border-radius:4px;margin-bottom:4px;font-size:0.85rem}
+.tag-card .member .remove-member{background:transparent;border:1px solid #666;color:#888;padding:2px 8px;border-radius:3px;cursor:pointer;font-size:0.75rem}
+.tag-card .member .remove-member:hover{border-color:#a44;color:#a44}
+.add-member-row{display:flex;gap:6px;margin-top:10px}
+.add-member-row input{flex:1;padding:8px;border:1px solid #333;border-radius:6px;background:#0f0f1a;color:#eee;font-size:0.85rem}
+.add-member-row button{padding:8px 14px;background:#5865F2;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:0.85rem}
+.create-tag-form{display:flex;gap:8px;margin-bottom:20px;flex-wrap:wrap}
+.create-tag-form input{flex:1;min-width:150px;padding:10px;border:1px solid #333;border-radius:8px;background:#0f0f1a;color:#eee;font-size:0.9rem}
+.create-tag-form button{padding:10px 20px;background:#5865F2;color:#fff;border:none;border-radius:8px;cursor:pointer}
+.unmapped-section{margin-top:24px}
+.unmapped-section h3{font-size:1rem;margin-bottom:12px;color:#aaa}
+.unmapped-item{display:flex;align-items:center;justify-content:space-between;padding:8px 12px;background:#1a1a2e;border-radius:6px;margin-bottom:6px;font-size:0.9rem}
+.unmapped-item .major-name{flex:1}
+.unmapped-item .major-count{color:#888;font-size:0.8rem;margin-left:8px;margin-right:12px}
+.unmapped-item select{padding:4px 8px;border:1px solid #333;border-radius:4px;background:#0f0f1a;color:#eee;font-size:0.8rem;margin-right:6px}
+.unmapped-item .assign-btn{background:#2d5a2d;color:#fff;border:none;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:0.8rem}
+.unmapped-item .assign-btn:hover{background:#3a7a3a}
+.unmapped-item .assign-btn:disabled{opacity:0.3;cursor:not-allowed}
 </style>
 </head>
 <body>
@@ -977,6 +1123,7 @@ tr:hover{background:#1a1a2e}
       <div class="tab" data-tab="attempts" onclick="switchTab(this)">Verify Attempts</div>
       <div class="tab" data-tab="admins" onclick="switchTab(this)">Admins</div>
       <div class="tab" data-tab="password" onclick="switchTab(this)">Change Password</div>
+      <div class="tab" data-tab="majors" onclick="switchTab(this)">Major Roles</div>
     </div>
 
     <div class="panel active" id="panel-dashboard">
@@ -1021,6 +1168,21 @@ tr:hover{background:#1a1a2e}
         </div>
         <button onclick="changePassword()" class="btn" style="width:100%;padding:12px;background:#5865F2;color:#fff;border:none;border-radius:8px;font-size:1rem;cursor:pointer">Update Password</button>
         <div id="pwdStatus" style="margin-top:16px;padding:12px;border-radius:8px;display:none"></div>
+      </div>
+    </div>
+
+    <div class="panel" id="panel-majors">
+      <h3 style="margin-bottom:12px;font-size:1rem">Create Tag</h3>
+      <div class="create-tag-form">
+        <input type="text" id="tagName" placeholder="Tag name (e.g. Sistem Informasi)">
+        <input type="text" id="tagRoleId" placeholder="Discord Role ID">
+        <button onclick="createMajorTag()">Create</button>
+      </div>
+      <h3 style="margin-bottom:12px;font-size:1rem">Tags</h3>
+      <div id="majorTagsList"></div>
+      <div class="unmapped-section">
+        <h3>Discovered Majors (unassigned)</h3>
+        <div id="unmappedMajorsList"></div>
       </div>
     </div>
   </div>
@@ -1097,6 +1259,7 @@ function switchTab(el) {
   if (el.dataset.tab === 'dashboard') loadDashboard();
   if (el.dataset.tab === 'attempts') loadAttempts();
   if (el.dataset.tab === 'admins') loadAdmins();
+  if (el.dataset.tab === 'majors') { loadMajorTags(); }
 }
 
 function setFilter(el) {
@@ -1269,6 +1432,143 @@ async function exportCSV() {
     alert('Failed to export CSV');
   }
 }
+
+let majorTagsCache = [];
+
+async function loadMajorTags() {
+  try {
+    const res = await fetch('/admin/major-tags', { headers: { 'Authorization': 'Bearer ' + token } });
+    const data = await res.json();
+    majorTagsCache = data.tags || [];
+    renderMajorTags();
+    loadUnmappedMajors();
+  } catch(e) {}
+}
+
+function renderMajorTags() {
+  const container = document.getElementById('majorTagsList');
+  if (!majorTagsCache.length) {
+    container.innerHTML = '<p style="color:#666;font-size:0.9rem">No tags created yet.</p>';
+    return;
+  }
+  container.innerHTML = majorTagsCache.map(t =>
+    '<div class="tag-card" data-tag-id="' + t.id + '">' +
+    '<div class="tag-header">' +
+    '<div><div class="tag-name">' + esc(t.name) + '</div><div class="tag-role">Role: ' + esc(t.discord_role_id) + '</div></div>' +
+    '<button class="del-tag-btn" onclick="deleteMajorTag(\\'' + t.id + '\\')">Delete</button>' +
+    '</div>' +
+    (t.members.length ? t.members.map(m =>
+      '<div class="member"><span>' + esc(m) + '</span><button class="remove-member" onclick="removeMajorMember(\\'' + t.id + '\\',\\'' + esc(m) + '\\')">Remove</button></div>'
+    ).join('') : '<div style="color:#666;font-size:0.85rem;margin-bottom:8px">No majors assigned</div>') +
+    '<div class="add-member-row">' +
+    '<input type="text" id="addMajor-' + t.id + '" placeholder="Study program name">' +
+    '<button onclick="addMajorMember(\\'' + t.id + '\\')">Add</button>' +
+    '</div>' +
+    '</div>'
+  ).join('');
+}
+
+function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+async function createMajorTag() {
+  const name = document.getElementById('tagName').value.trim();
+  const roleId = document.getElementById('tagRoleId').value.trim();
+  if (!name || !roleId) { alert('Tag name and Discord Role ID are required.'); return; }
+  try {
+    const res = await fetch('/admin/major-tags', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, discordRoleId: roleId })
+    });
+    const data = await res.json();
+    if (data.success) { document.getElementById('tagName').value = ''; document.getElementById('tagRoleId').value = ''; loadMajorTags(); }
+    else alert(data.error || 'Failed to create tag');
+  } catch(e) { alert('Network error'); }
+}
+
+async function deleteMajorTag(id) {
+  if (!confirm('Delete this tag and all its major assignments?')) return;
+  try {
+    const res = await fetch('/admin/major-tags', {
+      method: 'DELETE',
+      headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id })
+    });
+    const data = await res.json();
+    if (data.success) { loadMajorTags(); }
+    else alert(data.error || 'Failed to delete tag');
+  } catch(e) { alert('Network error'); }
+}
+
+async function addMajorMember(tagId) {
+  const input = document.getElementById('addMajor-' + tagId);
+  const studyProgram = input.value.trim();
+  if (!studyProgram) return;
+  try {
+    const res = await fetch('/admin/major-tags/members', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tagId, studyProgram })
+    });
+    const data = await res.json();
+    if (data.success) { loadMajorTags(); }
+    else alert(data.error || 'Failed to add major');
+  } catch(e) { alert('Network error'); }
+}
+
+async function removeMajorMember(tagId, studyProgram) {
+  try {
+    const res = await fetch('/admin/major-tags/members', {
+      method: 'DELETE',
+      headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tagId, studyProgram })
+    });
+    const data = await res.json();
+    if (data.success) { loadMajorTags(); }
+    else alert(data.error || 'Failed to remove major');
+  } catch(e) { alert('Network error'); }
+}
+
+async function loadUnmappedMajors() {
+  try {
+    const res = await fetch('/admin/unmapped-majors', { headers: { 'Authorization': 'Bearer ' + token } });
+    const data = await res.json();
+    const majors = data.majors || [];
+    const container = document.getElementById('unmappedMajorsList');
+    if (!majors.length) {
+      container.innerHTML = '<p style="color:#666;font-size:0.9rem">All discovered majors are assigned to tags.</p>';
+      return;
+    }
+    const tagOptions = majorTagsCache.map(t => '<option value="' + esc(t.id) + '">' + esc(t.name) + '</option>').join('');
+    container.innerHTML = majors.map(m =>
+      '<div class="unmapped-item">' +
+      '<span class="major-name">' + esc(m.study_program) + '</span>' +
+      '<span class="major-count">' + m.count + ' student' + (m.count > 1 ? 's' : '') + '</span>' +
+      (tagOptions ?
+        '<select id="assign-' + esc(m.study_program).replace(/[^a-zA-Z0-9]/g,'_') + '">' + tagOptions + '</select>' +
+        '<button class="assign-btn" onclick="quickAssignMajor(\\'' + esc(m.study_program).replace(/'/g,"\\\\'") + '\\')">Assign</button>'
+        : '<span style="color:#666;font-size:0.8rem">No tags</span>') +
+      '</div>'
+    ).join('');
+  } catch(e) {}
+}
+
+async function quickAssignMajor(studyProgram) {
+  const selectId = 'assign-' + studyProgram.replace(/[^a-zA-Z0-9]/g,'_');
+  const select = document.getElementById(selectId);
+  if (!select) return;
+  const tagId = select.value;
+  try {
+    const res = await fetch('/admin/major-tags/members', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tagId, studyProgram })
+    });
+    const data = await res.json();
+    if (data.success) { loadMajorTags(); }
+    else alert(data.error || 'Failed to assign');
+  } catch(e) { alert('Network error'); }
+}
 </script>
 </body>
 </html>`;
@@ -1326,6 +1626,24 @@ export default {
     }
     if (path === '/admin/change-password' && request.method === 'POST') {
       return handleAdminChangePassword(request, env);
+    }
+    if (path === '/admin/major-tags' && request.method === 'GET') {
+      return handleAdminListMajorTags(request, env);
+    }
+    if (path === '/admin/major-tags' && request.method === 'POST') {
+      return handleAdminCreateMajorTag(request, env);
+    }
+    if (path === '/admin/major-tags' && request.method === 'DELETE') {
+      return handleAdminDeleteMajorTag(request, env);
+    }
+    if (path === '/admin/major-tags/members' && request.method === 'POST') {
+      return handleAdminAddMajorMember(request, env, ctx);
+    }
+    if (path === '/admin/major-tags/members' && request.method === 'DELETE') {
+      return handleAdminRemoveMajorMember(request, env);
+    }
+    if (path === '/admin/unmapped-majors' && request.method === 'GET') {
+      return handleAdminUnmappedMajors(request, env);
     }
 
     // Verification page

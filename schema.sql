@@ -49,3 +49,18 @@ CREATE TABLE admins (
 --   1. GET /admin/hash-password?pwd=YourPassword to generate hash
 --   2. UPDATE admins SET password_hash = '<generated_hash>' WHERE email = 'krismyid@gmail.com'
 INSERT INTO admins (id, email) VALUES ('default', 'krismyid@gmail.com');
+
+CREATE TABLE major_tags (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    discord_role_id TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE major_tag_members (
+    tag_id TEXT NOT NULL REFERENCES major_tags(id) ON DELETE CASCADE,
+    study_program TEXT NOT NULL,
+    PRIMARY KEY (tag_id, study_program)
+);
+
+CREATE INDEX idx_tag_members_study_program ON major_tag_members(study_program);

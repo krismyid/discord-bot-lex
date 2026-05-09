@@ -1173,48 +1173,19 @@ async function handleAdminListAttempts(request, env) {
 
   const url = new URL(request.url);
   const filter = url.searchParams.get('filter') || 'all';
-  const search = url.searchParams.get('search') || '';
-  const page = Math.max(1, parseInt(url.searchParams.get('page') || '1'));
-  const perPage = Math.min(200, Math.max(10, parseInt(url.searchParams.get('perPage') || '50')));
-
-  // Build WHERE clause
-  const whereParts = [];
-  const whereBindings = [];
+  let whereClause = '';
 
   if (filter === 'mtd') {
-    whereParts.push("verified_at >= datetime('now', 'start of month')");
+    whereClause = "WHERE verified_at >= datetime('now', 'start of month')";
   } else if (filter === 'month') {
-    whereParts.push("verified_at >= datetime('now', '-30 days')");
+    whereClause = "WHERE verified_at >= datetime('now', '-30 days')";
   } else if (filter === 'year') {
-    whereParts.push("verified_at >= datetime('now', '-365 days')");
+    whereClause = "WHERE verified_at >= datetime('now', '-365 days')";
   }
 
-  if (search.trim()) {
-    const pattern = '%' + search.trim() + '%';
-    whereParts.push('(nama LIKE ? OR discord_username LIKE ? OR nim LIKE ? OR discord_id = ?)');
-    whereBindings.push(pattern, pattern, pattern, search.trim());
-  }
-
-  let whereClause = '';
-  if (whereParts.length > 0) {
-    whereClause = 'WHERE ' + whereParts.join(' AND ');
-  }
-
-  // Count total first
-  const countQuery = `SELECT COUNT(*) as total FROM verify_attempts ${whereClause}`;
-  const { results: countResults } = await env.DB.prepare(countQuery).bind(...whereBindings).all();
-  const total = countResults[0]?.total || 0;
-  const totalPages = Math.max(1, Math.ceil(total / perPage));
-  const actualPage = Math.min(page, totalPages);
-  const offset = (actualPage - 1) * perPage;
-
-  // Get paginated results
   const { results } = await env.DB.prepare(
-    `SELECT id, discord_id, discord_username, status, nim, nama, study_program, ut_region, class_of, myut_url, temp_image_id, ektm_image_url, created_at, verified_at
-     FROM verify_attempts ${whereClause}
-     ORDER BY created_at DESC
-     LIMIT ? OFFSET ?`
-  ).bind(...whereBindings, perPage, offset).all();
+    `SELECT id, discord_id, discord_username, status, nim, nama, study_program, ut_region, class_of, myut_url, temp_image_id, ektm_image_url, created_at, verified_at FROM verify_attempts ${whereClause} ORDER BY created_at DESC LIMIT 1000`
+  ).all();
 
   // Get all active blocks and build lookup sets
   const { results: blocks } = await env.DB.prepare(
@@ -1234,15 +1205,7 @@ async function handleAdminListAttempts(request, env) {
     is_blocked: (a.discord_id && blockedDiscordIds.has(a.discord_id)) || (a.nim && blockedNims.has(a.nim)),
   }));
 
-  return Response.json({
-    attempts,
-    pagination: {
-      page: actualPage,
-      perPage,
-      total,
-      totalPages,
-    }
-  });
+  return Response.json({ attempts });
 }
 
 async function handleAdminExportExcel(request, env) {
@@ -1519,8 +1482,7 @@ async function handleAdminUnblockMember(request, env) {
   const { discordId, nim } = await request.json();
   if (!discordId && !nim) return Response.json({ error: 'At least one of discordId or nim required' }, { status: 400 });
 
-  // Find and mark as expired OR delete
-  // Simpler: delete any matching active block entries
+  // Find and delete any matching active block entries
   const conditions = [];
   const bindings = [];
 
@@ -1703,27 +1665,12 @@ tr:hover{background:#1a1a2e}
           <div class="filter" data-filter="month" onclick="setFilter(this)">Last 30 Days</div>
           <div class="filter" data-filter="year" onclick="setFilter(this)">Last Year</div>
         </div>
-        <div style="display:flex;gap:8px;align-items:center">
-          <input type="text" id="searchInput" placeholder="Search by name, Discord, or NIM..." style="padding:8px 12px;border:1px solid #333;border-radius:6px;background:#0f0f1a;color:#eee;font-size:0.9rem;width:280px" onkeydown="if(event.key==='Enter')doSearch()">
-          <button class="export-btn" onclick="doSearch()">Search</button>
-          <button class="export-btn" data-action="export">Export</button>
-        </div>
+        <button class="export-btn" data-action="export">Export</button>
       </div>
       <table>
-        <thead><tr><th>NIM</th><th>Nama</th><th>Study Program</th><th>Discord</th><th>Status</th><th>Verified At</th><th>eKTM</th><th>Actions</th></tr></thead>
+        <thead><tr><th>NIM</th><th>Nama</th><th>Study Program</th><th>UT Region</th><th>Discord</th><th>Status</th><th>Verified At</th><th>eKTM</th></tr></thead>
         <tbody id="attemptsBody"></tbody>
       </table>
-      <div id="pagination" style="margin-top:16px;display:flex;gap:12px;align-items:center;justify-content:space-between;color:#888;font-size:0.9rem">
-        <div id="pageInfo">Page 1 of 1</div>
-        <div style="display:flex;gap:8px;align-items:center">
-          <button class="view-btn" onclick="goToPage(currentPage-1)" disabled id="prevBtn">Prev</button>
-          <div id="pageNumbers" style="display:flex;gap:4px"></div>
-          <button class="view-btn" onclick="goToPage(currentPage+1)" disabled id="nextBtn">Next</button>
-          <span style="margin-left:8px">Go to:</span>
-          <input type="number" id="jumpToPage" min="1" style="width:60px;padding:4px 8px;border:1px solid #333;border-radius:4px;background:#0f0f1a;color:#eee;text-align:center">
-          <button class="view-btn" onclick="goToPage(parseInt(document.getElementById('jumpToPage').value))">Go</button>
-        </div>
-      </div>
     </div>
 
     <div class="panel" id="panel-admins">
@@ -1778,8 +1725,6 @@ tr:hover{background:#1a1a2e}
 <script>
 let token = localStorage.getItem('admin_token');
 let currentFilter = 'all';
-let currentPage = 1;
-let currentSearch = '';
 
 // Delegated click handlers for dynamic buttons
 document.addEventListener('click', function(e) {
@@ -1904,20 +1849,6 @@ function setFilter(el) {
   document.querySelectorAll('.filter').forEach(f => f.classList.remove('active'));
   el.classList.add('active');
   currentFilter = el.dataset.filter;
-  currentPage = 1;
-  loadAttempts();
-}
-
-function doSearch() {
-  const q = document.getElementById('searchInput').value.trim();
-  currentSearch = q;
-  currentPage = 1;
-  loadAttempts();
-}
-
-function goToPage(p) {
-  if (p < 1) return;
-  currentPage = p;
   loadAttempts();
 }
 
@@ -1936,202 +1867,24 @@ async function loadDashboard() {
   } catch(e) {}
 }
 
-function esc(s) {
-  if (s == null) return '';
-  const d = document.createElement('div');
-  d.textContent = String(s);
-  return d.innerHTML;
-}
-
 async function loadAttempts() {
   try {
-    let url = '/admin/attempts?filter=' + encodeURIComponent(currentFilter) + '&page=' + currentPage;
-    if (currentSearch) {
-      url += '&search=' + encodeURIComponent(currentSearch);
-    }
-
-    const res = await fetch(url, { headers: { 'Authorization': 'Bearer ' + token } });
+    const res = await fetch('/admin/attempts?filter=' + currentFilter, { headers: { 'Authorization': 'Bearer ' + token } });
     const data = await res.json();
     const tbody = document.getElementById('attemptsBody');
-    const attempts = data.attempts || [];
-    const pag = data.pagination || { page: 1, total: 0, totalPages: 1 };
-
-    // Update currentPage to actual returned page
-    currentPage = pag.page;
-
-    tbody.innerHTML = attempts.map(a => {
-      const isApproved = a.status === 'approved';
-      let actions = '-';
-      if (isApproved) {
-        const jsonData = JSON.stringify({
-          discord_id: a.discord_id,
-          nim: a.nim,
-        }).replace(/"/g, '&quot;');
-
-        if (a.is_blocked) {
-          actions =
-            '<div style="display:flex;gap:4px;flex-wrap:wrap">' +
-            '<span class="badge failed" style="padding:4px 8px">Blocked</span>' +
-            '<button class="view-btn" data-member="' + jsonData + '" onclick="unblockMember(this)">Unblock</button>' +
-            '</div>';
-        } else {
-          actions =
-            '<div style="display:flex;gap:4px;flex-wrap:wrap">' +
-            '<button class="view-btn" data-member="' + jsonData + '" onclick="dropMember(this)">Drop</button>' +
-            '<select class="block-select" data-member="' + jsonData + '" style="padding:4px 8px;border:1px solid #333;border-radius:4px;background:#0f0f1a;color:#eee;font-size:0.8rem">' +
-              '<option value="">Block...</option>' +
-              '<option value="3">3d</option>' +
-              '<option value="7">7d</option>' +
-              '<option value="14">14d</option>' +
-              '<option value="30">30d</option>' +
-              '<option value="90">90d</option>' +
-              '<option value="0">Forever</option>' +
-            '</select>' +
-            '</div>';
-        }
-      }
-      return (
-        '<tr>' +
-        '<td>' + (a.nim || '-') + '</td>' +
-        '<td>' + (a.nama || '-') + '</td>' +
-        '<td>' + (a.study_program || '-') + '</td>' +
-        '<td>' + a.discord_username + '</td>' +
-        '<td><span class="badge ' + a.status + '">' + a.status + '</span></td>' +
-        '<td>' + (a.verified_at || '-') + '</td>' +
-        '<td>' + (a.ektm_image_url ? '<button class="view-btn" data-ektm-key="' + a.ektm_image_url + '">View</button>' : '-') + '</td>' +
-        '<td>' + actions + '</td>' +
-        '</tr>'
-      );
-    }).join('');
-
-    // Attach change handlers to block selects
-    document.querySelectorAll('.block-select').forEach(sel => {
-      sel.onchange = async function() {
-        if (sel.value) {
-          await blockMember(sel);
-        }
-      };
-    });
-
-    // Update pagination UI
-    document.getElementById('pageInfo').textContent =
-      'Page ' + pag.page + ' of ' + pag.totalPages + ' (' + pag.total + ' total records)';
-
-    const prevBtn = document.getElementById('prevBtn');
-    const nextBtn = document.getElementById('nextBtn');
-    const jumpInput = document.getElementById('jumpToPage');
-
-    prevBtn.disabled = pag.page <= 1;
-    nextBtn.disabled = pag.page >= pag.totalPages;
-    jumpInput.max = pag.totalPages;
-
-    // Render page numbers (show up to 7 pages around current)
-    const container = document.getElementById('pageNumbers');
-    const pages = [];
-
-    // First page
-    if (pag.totalPages >= 1) pages.push(1);
-
-    // Pages around current
-    const rangeStart = Math.max(2, pag.page - 2);
-    const rangeEnd = Math.min(pag.totalPages - 1, pag.page + 2);
-
-    if (rangeStart <= rangeEnd) {
-      const last = pages[pages.length - 1];
-      if (last && last !== rangeStart - 1 && last !== '...') pages.push('...');
-      for (let i = rangeStart; i <= rangeEnd; i++) pages.push(i);
-    }
-
-    // Last page
-    if (pag.totalPages > 1) {
-      const last = pages[pages.length - 1];
-      if (last && last !== pag.totalPages - 1 && last !== '...') pages.push('...');
-      pages.push(pag.totalPages);
-    }
-
-    container.innerHTML = pages.map(p => {
-      if (p === '...') return '<span style="padding:4px 8px;color:#666">...</span>';
-      const isActive = p === pag.page;
-      const style = isActive
-        ? 'background:#5865F2;color:#fff;border-radius:4px;padding:4px 10px;cursor:pointer;font-size:0.9rem;text-decoration:none'
-        : 'background:#1a1a2e;color:#888;border-radius:4px;padding:4px 10px;cursor:pointer;font-size:0.9rem;text-decoration:none';
-      return '<span style="' + style + '" onclick="goToPage(' + p + ')">' + p + '</span>';
-    }).join('');
+    tbody.innerHTML = (data.attempts || []).map(a =>
+      '<tr>' +
+      '<td>' + (a.nim || '-') + '</td>' +
+      '<td>' + (a.nama || '-') + '</td>' +
+      '<td>' + (a.study_program || '-') + '</td>' +
+      '<td>' + (a.ut_region || '-') + '</td>' +
+      '<td>' + a.discord_username + '</td>' +
+      '<td><span class="badge ' + a.status + '">' + a.status + '</span></td>' +
+      '<td>' + (a.verified_at || '-') + '</td>' +
+      '<td>' + (a.ektm_image_url ? '<button class="view-btn" data-ektm-key="' + a.ektm_image_url + '">View</button>' : '-') + '</td>' +
+      '</tr>'
+    ).join('');
   } catch(e) {}
-}
-
-async function dropMember(btn) {
-  const data = JSON.parse(btn.getAttribute('data-member').replace(/&quot;/g, '"'));
-  const discordId = data.discord_id;
-  if (!discordId) return;
-  if (!confirm('Remove ALL roles (Verified + major roles) from this member?')) return;
-
-  try {
-    const res = await fetch('/admin/members/drop', {
-      method: 'POST',
-      headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ discordId })
-    });
-    const result = await res.json();
-    if (result.success) {
-      alert('Roles removed: ' + result.rolesRemoved + ' role(s)');
-    } else {
-      alert('Failed: ' + (result.error || 'unknown'));
-    }
-  } catch(e) { alert('Network error'); }
-}
-
-async function blockMember(sel) {
-  const data = JSON.parse(sel.getAttribute('data-member').replace(/&quot;/g, '"'));
-  const durationDays = parseInt(sel.value);
-  const discordId = data.discord_id;
-  const nim = data.nim;
-
-  if (!discordId && !nim) { alert('No identifiers available'); sel.value = ''; return; }
-
-  const durationLabel = durationDays === 0 ? 'Forever' : (durationDays + ' day' + (durationDays > 1 ? 's' : ''));
-  const alsoDrop = confirm('Block this member for ' + durationLabel + '?\n\nAlso drop all their roles now?\n(Cancel = block but keep roles)');
-
-  try {
-    const res = await fetch('/admin/members/block', {
-      method: 'POST',
-      headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ discordId, nim, durationDays, alsoDrop })
-    });
-    const result = await res.json();
-    if (result.success) {
-      const msg = 'Member blocked' + (result.dropResult ? ' (' + result.dropResult.rolesRemoved + ' roles removed)' : '');
-      alert(msg);
-      loadAttempts();
-    } else {
-      alert('Failed: ' + (result.error || 'unknown'));
-    }
-  } catch(e) { alert('Network error'); }
-
-  sel.value = '';
-}
-
-async function unblockMember(btn) {
-  const data = JSON.parse(btn.getAttribute('data-member').replace(/&quot;/g, '"'));
-  const discordId = data.discord_id;
-  const nim = data.nim;
-
-  if (!confirm('Unblock this member?')) return;
-
-  try {
-    const res = await fetch('/admin/members/unblock', {
-      method: 'POST',
-      headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ discordId, nim })
-    });
-    const result = await res.json();
-    if (result.success) {
-      alert('Unblocked. Removed ' + result.entriesRemoved + ' block entry(ies).');
-      loadAttempts();
-    } else {
-      alert('Failed: ' + (result.error || 'unknown'));
-    }
-  } catch(e) { alert('Network error'); }
 }
 
 async function loadAdmins() {
@@ -2305,6 +2058,8 @@ function renderMajorTags() {
     '</div>'
   ).join('');
 }
+
+function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 
 async function createMajorTag() {
   const name = document.getElementById('tagName').value.trim();

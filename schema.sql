@@ -77,3 +77,16 @@ CREATE TABLE admin_tokens (
 
 CREATE INDEX idx_admin_tokens_email ON admin_tokens(admin_email);
 CREATE INDEX idx_admin_tokens_token_hash ON admin_tokens(token_hash);
+
+CREATE TABLE blocked_members (
+    id TEXT PRIMARY KEY,
+    discord_id TEXT,
+    nim TEXT,
+    reason TEXT,
+    blocked_at TEXT DEFAULT (datetime('now')),
+    expires_at TEXT,
+    blocked_by_email TEXT NOT NULL
+);
+
+CREATE INDEX idx_blocked_discord_id ON blocked_members(discord_id);
+CREATE INDEX idx_blocked_nim ON blocked_members(nim);

@@ -680,7 +680,10 @@ const MAIL_FROM = 'lexcriminalis@mg.kris.my.id';
 
 async function sendMail(env, to, subject, html, text) {
   const apiKey = env.MAILGUN_API_KEY;
-  if (!apiKey) return { ok: false, error: 'MAILGUN_API_KEY not configured' };
+  if (!apiKey) {
+    console.log('[Mailgun] Error: MAILGUN_API_KEY not configured');
+    return { ok: false, error: 'MAILGUN_API_KEY not configured' };
+  }
 
   const formData = new FormData();
   formData.append('from', MAIL_FROM);
@@ -692,6 +695,8 @@ async function sendMail(env, to, subject, html, text) {
   const url = `${MAILGUN_API_BASE}/${MAILGUN_DOMAIN}/messages`;
   const credentials = btoa(`api:${apiKey}`);
 
+  console.log(`[Mailgun] Sending to ${to}, URL: ${url}`);
+
   const res = await fetch(url, {
     method: 'POST',
     headers: {
@@ -700,10 +705,16 @@ async function sendMail(env, to, subject, html, text) {
     body: formData,
   });
 
+  console.log(`[Mailgun] Response status: ${res.status}`);
+
   if (!res.ok) {
     const errText = await res.text().catch(() => '');
+    console.log(`[Mailgun] Error response: ${errText}`);
     return { ok: false, error: `Mailgun API ${res.status}: ${errText}` };
   }
+
+  const responseBody = await res.text().catch(() => '');
+  console.log(`[Mailgun] Success response: ${responseBody}`);
 
   return { ok: true };
 }
